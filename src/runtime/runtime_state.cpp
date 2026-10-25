@@ -527,7 +527,7 @@ void RuntimeState::ensureTableArrayCapacity(LuaTable* tbl, uint32_t min_cap) {
     uintptr_t mem = impl_->active_heap->allocate(
         static_cast<size_t>(new_cap) * sizeof(uint64_t),
         getLayouts().leaf,
-        brass::gc::kAllocPinned,
+        brass::gc::kAllocPinned | brass::gc::kAllocUninitialized,  // every slot written below
         kHostKindBuffer);
     auto* new_arr = reinterpret_cast<uint64_t*>(mem);
     for (uint32_t i = 0; i < tbl->array_cap; ++i) {
@@ -550,7 +550,7 @@ void RuntimeState::ensureTableHashCapacity(LuaTable* tbl, uint32_t min_entries) 
     uintptr_t mem = impl_->active_heap->allocate(
         static_cast<size_t>(new_cap) * sizeof(LuaHashEntry),
         getLayouts().leaf,
-        brass::gc::kAllocPinned,
+        brass::gc::kAllocPinned | brass::gc::kAllocUninitialized,  // every entry written below
         kHostKindBuffer);
     auto* new_hash = reinterpret_cast<LuaHashEntry*>(mem);
     for (uint32_t i = 0; i < new_cap; ++i) {
