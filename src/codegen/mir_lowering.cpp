@@ -65,7 +65,6 @@ void MirModuleLowerer::declareRuntimeExternals() {
     decl("brasslua_rt_call_method");
     decl("brasslua_rt_call_method_multiret");
     decl("brasslua_rt_set_multiret");
-    decl("brasslua_rt_clear_multiret");
     decl("brasslua_rt_prepend_multiret");
     decl("brasslua_rt_set_vararg_multiret");
     decl("brasslua_rt_get_multiret_count");

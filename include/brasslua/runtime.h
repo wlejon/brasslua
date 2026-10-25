@@ -81,6 +81,8 @@ public:
     }
     void setMultiRet(const uint64_t* vals, size_t count);
     bool isMultiRetSet() const noexcept { return multiret_mode_ != 0; }
+    // Compiled code clears the mode with a store here (its code is this state's).
+    uint8_t* multiRetModeSlot() noexcept { return &multiret_mode_; }
     size_t multiRetCount() const noexcept {
         if (multiret_mode_ == 1) return 1;
         return multiret_mode_ == 2 ? multiret_.size() : 0;

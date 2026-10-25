@@ -6,16 +6,6 @@ namespace brasslua {
 using brass::BasicBlock;
 using brass::Type;
 
-namespace {
-
-bool isCallOrVararg(const Expr& e) noexcept {
-    return std::holds_alternative<CallExpr>(e.node) ||
-           std::holds_alternative<MethodCallExpr>(e.node) ||
-           std::holds_alternative<VarargExpr>(e.node);
-}
-
-} // namespace
-
 MirValue MirModuleLowerer::lowerIndexLoad(FunctionBuildState& st, const IndexExpr& idx_expr,
                                           InferredType inferred_type) {
     auto& b = st.builder;

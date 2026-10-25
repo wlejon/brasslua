@@ -172,6 +172,8 @@ struct Expr {
     Variant node;
     SourceLoc loc;
     InferredType inferred_type = InferredType::Unknown;
+    // Written in parentheses: a call or `...` gives its first value only.
+    bool parenthesized = false;
 
     template <typename T>
     explicit Expr(T&& v, SourceLoc l = {})

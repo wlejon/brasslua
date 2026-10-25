@@ -25,6 +25,10 @@ enum class Rep : uint8_t {
     BoolBit = 3, // brass::Type::i32() (unboxed 0/1 boolean condition)
 };
 
+// A call or `...` that may give any number of values (not in parentheses,
+// and not a single-valued math/bit intrinsic).
+bool isCallOrVararg(const Expr& e) noexcept;
+
 struct MirValue {
     brass::Value* val = nullptr;
     Rep rep = Rep::Boxed;
@@ -63,6 +67,9 @@ struct FunctionBuildState {
     brass::Function* fn = nullptr;
     brass::Builder builder;
     bool is_unboxed_variant = false;
+    // Set by lowerMultiExpr for the call it lowers, which then leaves all its
+    // results in the multiret buffer; any other call wants one result.
+    bool multi_result_wanted = false;
     Rep expected_return_rep = Rep::Boxed;
 
     brass::Value* closure_arg = nullptr;

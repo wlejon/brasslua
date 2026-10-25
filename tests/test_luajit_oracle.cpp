@@ -289,6 +289,32 @@ int runLuaOracleTests() {
                 print(math.type(t.y + t.y), math.type(t.y + t.f), math.type(t.y / t.y))
             )LUA"
         },
+        {
+            "lua54_one_result_after_multi_result_calls",
+            "lua5.4",
+            R"LUA(
+                local t = {}
+                function t.g(x) return x, 9 end
+                local function A(x) local y = t.g(x) return y + 1 end
+                print(A(1))
+                local function B(n)
+                    local r
+                    for i = 1, 2 do
+                        if i == 2 then return r end
+                        r = t.g(i)
+                    end
+                end
+                print(B(1))
+                local o = { k = 5 }
+                function o:pair() return self.k, self.k * 2 end
+                local function C() local a = o:pair() return a end
+                print(C(), select('#', C()))
+                print(o:pair())
+                print((o:pair()))
+                local function D() return t.g(4) end
+                print(D())
+            )LUA"
+        },
     };
 
     for (const auto& tc : cases) {

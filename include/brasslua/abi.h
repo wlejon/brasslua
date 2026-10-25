@@ -52,7 +52,6 @@ uint64_t brasslua_rt_call_multiret(uint64_t callee, const uint64_t* prefix_args,
 uint64_t brasslua_rt_call_method_multiret(uint64_t obj, uint64_t method_key,
                                           const uint64_t* prefix_args, int64_t prefix_count);
 void     brasslua_rt_set_multiret(const uint64_t* vals, int64_t count);
-void     brasslua_rt_clear_multiret(void);
 uint64_t brasslua_rt_prepend_multiret(const uint64_t* prefix, int64_t prefix_count);
 uint64_t brasslua_rt_set_vararg_multiret(const uint64_t* args_ptr, int64_t nargs, int64_t vararg_offset);
 int64_t  brasslua_rt_get_multiret_count(void);

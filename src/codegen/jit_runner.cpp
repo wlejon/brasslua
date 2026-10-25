@@ -66,7 +66,6 @@ void registerBrassLuaRuntimeSymbols(brass::codegen::JitExecutionEngine& engine) 
     reg("brasslua_rt_call_method", &brasslua_rt_call_method, Type::i64(), {Type::i64(), Type::i64(), Type::ptr(), Type::i64()});
     reg("brasslua_rt_call_method_multiret", &brasslua_rt_call_method_multiret, Type::i64(), {Type::i64(), Type::i64(), Type::ptr(), Type::i64()});
     reg("brasslua_rt_set_multiret", &brasslua_rt_set_multiret, Type::void_type(), {Type::ptr(), Type::i64()});
-    reg("brasslua_rt_clear_multiret", &brasslua_rt_clear_multiret, Type::void_type(), {});
     reg("brasslua_rt_prepend_multiret", &brasslua_rt_prepend_multiret, Type::i64(), {Type::ptr(), Type::i64()});
     reg("brasslua_rt_set_vararg_multiret", &brasslua_rt_set_vararg_multiret, Type::i64(), {Type::ptr(), Type::i64(), Type::i64()});
     reg("brasslua_rt_get_multiret_count", &brasslua_rt_get_multiret_count, Type::i64(), {});

@@ -7,12 +7,6 @@ using brass::Type;
 
 namespace {
 
-bool isCallOrVararg(const Expr& e) noexcept {
-    return std::holds_alternative<CallExpr>(e.node) ||
-           std::holds_alternative<MethodCallExpr>(e.node) ||
-           std::holds_alternative<VarargExpr>(e.node);
-}
-
 bool exprContainsClosure(const Expr& expr) noexcept {
     return std::visit(
         [](const auto& e) -> bool {
@@ -560,29 +554,10 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 if (s.values.size() == 1) {
                     MirValue mv = lowerExpr(st, *s.values[0]);
                     BValue* boxed = emitBox(st, mv);
-                    bool func_has_multiret_call = false;
-                    for (const auto& blk : st.fn->blocks()) {
-                        for (const auto* inst : *blk) {
-                            if (inst->opcode() == brass::Opcode::call) {
-                                std::string_view callee = inst->symbol();
-                                if (callee != "brasslua_rt_box_int64" &&
-                                    callee != "brasslua_rt_to_number" &&
-                                    callee != "brasslua_rt_to_int64" &&
-                                    callee != "brasslua_rt_upvalue_new" &&
-                                    callee != "brasslua_rt_upvalue_get" &&
-                                    callee != "brasslua_rt_upvalue_set" &&
-                                    callee != "brasslua_rt_closure_new" &&
-                                    callee != "brasslua_rt_table_new") {
-                                    func_has_multiret_call = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (func_has_multiret_call) break;
-                    }
-                    if (func_has_multiret_call) {
-                        b.build_call("brasslua_rt_clear_multiret", Type::void_type(), {});
-                    }
+                    // One value: whatever a call before it left in the multiret
+                    // buffer is not this function's result.
+                    auto slot = reinterpret_cast<intptr_t>(rt_.multiRetModeSlot());
+                    b.build_store(Type::i8(), b.build_iconst_i64(slot), 0, b.build_trunc_i8(b.build_iconst_i32(0)));
                     b.build_ret(boxed);
                     return;
                 }

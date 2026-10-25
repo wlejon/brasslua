@@ -585,6 +585,7 @@ private:
                 advance();
                 ExprPtr inner = parseExpr();
                 expect(TokenKind::RParen, "expected ')' after parenthesized expression");
+                inner->parenthesized = true;
                 return inner;
             }
             case TokenKind::LBrace:

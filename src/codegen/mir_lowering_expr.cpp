@@ -5,9 +5,8 @@ namespace brasslua {
 using brass::BasicBlock;
 using brass::Type;
 
-namespace {
-
 bool isCallOrVararg(const Expr& e) noexcept {
+    if (e.parenthesized) return false;
     if (std::holds_alternative<VarargExpr>(e.node) || std::holds_alternative<MethodCallExpr>(e.node)) {
         return true;
     }
@@ -26,6 +25,8 @@ bool isCallOrVararg(const Expr& e) noexcept {
     }
     return false;
 }
+
+namespace {
 
 void populateClosureUpvalues(MirModuleLowerer& lowerer, FunctionBuildState& st,
                              const CompiledFuncSig& sig, BValue* cl_bits) {
@@ -145,6 +146,32 @@ MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, B
 
     b.position_at_end(merge_bb);
     return MirValue{merge_bb->param(0), is_cmp ? Rep::BoolBit : Rep::Boxed};
+}
+
+// A call wanting one result: a Lua closure is called through its entry here
+// (its return sets the multi-return state, which nothing reads after a
+// one-result call); anything else is the runtime's (`__call`, errors).
+BValue* emitClosureCall(FunctionBuildState& st, BValue* callee_bits, BValue* arg_buf, BValue* nargs_v) {
+    auto& b = st.builder;
+    BValue* tag = b.build_lshr(callee_bits, b.build_iconst_i64(48));
+    BValue* is_fn = b.build_eq(tag, b.build_iconst_i64(static_cast<int64_t>(Tag::Function)));
+    BasicBlock* fn_bb = st.newBlock("ccall_fn");
+    BasicBlock* slow_bb = st.newBlock("ccall_slow");
+    BasicBlock* merge_bb = st.newBlock("ccall_merge", {Type::i64()});
+    b.build_br_if(is_fn, fn_bb, slow_bb);
+
+    b.position_at_end(fn_bb);
+    BValue* cl = b.build_and(callee_bits, b.build_iconst_i64(static_cast<int64_t>(kPayloadMask)));
+    BValue* entry = b.build_load(Type::ptr(), cl, static_cast<int32_t>(offsetof(LuaClosure, fn)));
+    BValue* fast = b.build_call_indirect(entry, Type::i64(), {cl, arg_buf, nargs_v});
+    b.build_br(merge_bb, {fast});
+
+    b.position_at_end(slow_bb);
+    BValue* slow = b.build_call("brasslua_rt_call", Type::i64(), {callee_bits, arg_buf, nargs_v});
+    b.build_br(merge_bb, {slow});
+
+    b.position_at_end(merge_bb);
+    return merge_bb->param(0);
 }
 
 } // namespace
@@ -374,7 +401,9 @@ MirValue MirModuleLowerer::lowerMultiExpr(FunctionBuildState& st, const Expr& ex
         b.build_call("brasslua_rt_set_multiret", Type::void_type(), {zero, zero});
         return MirValue{b.build_iconst_i64(static_cast<int64_t>(kNilBits)), Rep::Boxed, false};
     }
+    st.multi_result_wanted = true;
     MirValue mv = lowerExpr(st, expr);
+    st.multi_result_wanted = false;
     if (!mv.single) return mv;
     BValue* boxed = emitBox(st, mv);
     BValue* one = st.emitEntryAlloca(8, 8);
@@ -386,6 +415,7 @@ MirValue MirModuleLowerer::lowerMultiExpr(FunctionBuildState& st, const Expr& ex
 
 MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr& call, InferredType /*result_type*/) {
     auto& b = st.builder;
+    const bool want_multi = std::exchange(st.multi_result_wanted, false);
 
     bool last_is_multiret = !call.args.empty() && isCallOrVararg(*call.args.back());
 
@@ -533,22 +563,6 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
     MirValue callee_mv = lowerExpr(st, *call.callee);
     BValue* callee_bits = emitBox(st, callee_mv);
 
-    if (!last_is_multiret && call.args.size() <= 4) {
-        std::vector<BValue*> bargs;
-        bargs.push_back(callee_bits);
-        for (const auto& arg : call.args) {
-            MirValue amv = lowerExpr(st, *arg);
-            bargs.push_back(emitBox(st, amv));
-        }
-        const char* helper = "brasslua_rt_call_0";
-        if (call.args.size() == 1) helper = "brasslua_rt_call_1";
-        else if (call.args.size() == 2) helper = "brasslua_rt_call_2";
-        else if (call.args.size() == 3) helper = "brasslua_rt_call_3";
-        else if (call.args.size() == 4) helper = "brasslua_rt_call_4";
-        BValue* res = b.build_call(helper, Type::i64(), brass::Span<BValue* const>(bargs));
-        return MirValue{res, Rep::Boxed};
-    }
-
     // Allocate a dedicated stack buffer for this call's fixed prefix arguments so nested calls
     // with > 4 arguments never overwrite an outer call's arguments.
     size_t fixed_count = last_is_multiret ? (call.args.size() - 1) : call.args.size();
@@ -568,7 +582,8 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
         res = b.build_call("brasslua_rt_call_multiret", Type::i64(), {callee_bits, arg_buf, fixed_v});
     } else {
         BValue* nargs_v = b.build_iconst_i64(static_cast<int64_t>(call.args.size()));
-        res = b.build_call("brasslua_rt_call", Type::i64(), {callee_bits, arg_buf, nargs_v});
+        res = want_multi ? b.build_call("brasslua_rt_call", Type::i64(), {callee_bits, arg_buf, nargs_v})
+                         : emitClosureCall(st, callee_bits, arg_buf, nargs_v);
     }
 
     if (fixed_count > 0) {
@@ -584,6 +599,7 @@ MirValue MirModuleLowerer::lowerMethodCallExpr(FunctionBuildState& st, const Met
     // Rule 6: `obj:m(x)` statically emits `brasslua_rt_call_method`, passing `obj` as the
     // explicit receiver and `(x)` as the arguments!
     auto& b = st.builder;
+    const bool want_multi = std::exchange(st.multi_result_wanted, false);
     MirValue obj_mv = lowerExpr(st, *mcall.object);
     BValue* obj_bits = emitBox(st, obj_mv);
     uint32_t id = mcall.intern_id != 0 ? mcall.intern_id : rt_.internString(mcall.method);
@@ -614,7 +630,8 @@ MirValue MirModuleLowerer::lowerMethodCallExpr(FunctionBuildState& st, const Met
     b.position_at_end(hit_bb);
     BValue* fast_res = last_is_multiret
         ? b.build_call("brasslua_rt_call_multiret", Type::i64(), {hit_bb->param(0), arg_buf, fixed_c})
-        : b.build_call("brasslua_rt_call", Type::i64(), {hit_bb->param(0), arg_buf, fixed_c});
+        : want_multi ? b.build_call("brasslua_rt_call", Type::i64(), {hit_bb->param(0), arg_buf, fixed_c})
+                     : emitClosureCall(st, hit_bb->param(0), arg_buf, fixed_c);
     b.build_br(merge_bb, {fast_res});
 
     b.position_at_end(slow_bb);

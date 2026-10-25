@@ -355,10 +355,6 @@ void brasslua_rt_set_multiret(const uint64_t* vals, int64_t count) {
     RuntimeState::current().setMultiRet(vals, count > 0 ? static_cast<size_t>(count) : 0);
 }
 
-void brasslua_rt_clear_multiret(void) {
-    RuntimeState::current().clearMultiRet();
-}
-
 uint64_t brasslua_rt_prepend_multiret(const uint64_t* prefix_vals, int64_t prefix_count) {
     auto& rt = RuntimeState::current();
     const size_t tail_count = rt.multiRetCount();
