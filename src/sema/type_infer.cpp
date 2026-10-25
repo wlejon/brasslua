@@ -41,14 +41,6 @@ public:
         // Pass 0: Lexical symbol & upvalue resolution
         resolveChunkSymbols(chunk);
 
-        static constexpr const char* kCommonFields[] = {
-            "x", "y", "z", "vx", "vy", "vz", "mass", "next", "prev", "left", "right", "val", "key"
-        };
-        for (const char* f : kCommonFields) {
-            uint32_t id = rt_.internString(f);
-            rt_.getOrAssignFieldSlot(id);
-        }
-
         // Pre-scan for `setmetatable`, stdlib aliases, and table nil/truthiness checks
         prescanStmts(chunk.body);
         resolveFactoryClosures();
@@ -541,11 +533,7 @@ private:
                         rt_.internString(part);
                     }
                     if (!s.method.empty()) {
-                        uint32_t mid = rt_.internString(s.method);
-                        rt_.getOrAssignFieldSlot(mid);
-                    } else if (s.path.size() > 1) {
-                        uint32_t fid = rt_.internString(s.path.back());
-                        rt_.getOrAssignFieldSlot(fid);
+                        rt_.internString(s.method);
                     }
                     std::string fkey;
                     if (s.path.size() == 1 && s.method.empty()) {
@@ -591,6 +579,11 @@ private:
                     if (base->name == "math") {
                         if (fe->field == "type") return InferredType::String;
                         if (fe->field == "ult") return InferredType::Bool;
+                        static constexpr const char* kFloatOnly[] = {"sqrt", "sin", "cos", "tan", "asin",
+                                                                     "acos", "atan", "exp", "log"};
+                        for (const char* f : kFloatOnly) {
+                            if (fe->field == f) return InferredType::Float64;
+                        }
                         return InferredType::Number;
                     }
                     if (base->name == "bit" || base->name == "bit32") {
@@ -644,8 +637,11 @@ private:
                             if (e.operand->inferred_type == InferredType::Int64) {
                                 return InferredType::Int64;
                             }
-                            if (isNumeric(e.operand->inferred_type) || !uses_metatables_) {
+                            if (e.operand->inferred_type == InferredType::Float64) {
                                 return InferredType::Float64;
+                            }
+                            if (isNumeric(e.operand->inferred_type) || !uses_metatables_) {
+                                return InferredType::Number;
                             }
                             return InferredType::Any;
                     }
@@ -660,6 +656,7 @@ private:
                         case BinOp::Sub:
                         case BinOp::Mul:
                         case BinOp::Mod:
+                        case BinOp::IDiv:
                             if (lt == InferredType::Int64 && rt == InferredType::Int64) {
                                 return InferredType::Int64;
                             }
@@ -667,23 +664,18 @@ private:
                                 (lt == InferredType::Unknown && rt == InferredType::Int64)) {
                                 return InferredType::Unknown;
                             }
-                            if (isNumeric(lt) && isNumeric(rt)) {
+                            // A float operand makes a float; otherwise an integer
+                            // may come out, so the result is only a Number.
+                            if ((lt == InferredType::Float64 && (isNumeric(rt) || !uses_metatables_)) ||
+                                (rt == InferredType::Float64 && (isNumeric(lt) || !uses_metatables_))) {
                                 return InferredType::Float64;
                             }
-                            if (!uses_metatables_) {
-                                return InferredType::Float64;
+                            if ((isNumeric(lt) && isNumeric(rt)) || !uses_metatables_) {
+                                return InferredType::Number;
                             }
                             return InferredType::Any;
                         case BinOp::Div:
                         case BinOp::Pow:
-                            if ((isNumeric(lt) && isNumeric(rt)) || !uses_metatables_) {
-                                return InferredType::Float64;
-                            }
-                            return InferredType::Any;
-                        case BinOp::IDiv:
-                            if (lt == InferredType::Int64 && rt == InferredType::Int64) {
-                                return InferredType::Int64;
-                            }
                             if ((isNumeric(lt) && isNumeric(rt)) || !uses_metatables_) {
                                 return InferredType::Float64;
                             }
@@ -720,7 +712,6 @@ private:
                         }
                         if (!f.field_name.empty()) {
                             f.intern_id = rt_.internString(f.field_name);
-                            f.slot_hint = rt_.getOrAssignFieldSlot(f.intern_id);
                         }
                         if (f.value) {
                             analyzeExpr(*f.value);
@@ -749,7 +740,6 @@ private:
                 } else if constexpr (std::is_same_v<T, FieldExpr>) {
                     analyzeExpr(*e.table);
                     e.intern_id = rt_.internString(e.field);
-                    e.slot_hint = rt_.getOrAssignFieldSlot(e.intern_id);
                     if (!uses_metatables_) {
                         auto it = field_types_.find(e.field);
                         if (it != field_types_.end() && isNumeric(it->second)) {
@@ -771,7 +761,6 @@ private:
                                 fe.table = std::move(base_expr);
                                 fe.field = ait->second.second;
                                 fe.intern_id = rt_.internString(fe.field);
-                                fe.slot_hint = rt_.getOrAssignFieldSlot(fe.intern_id);
                                 e.callee->node = std::move(fe);
                             }
                         }
@@ -824,7 +813,6 @@ private:
                 } else if constexpr (std::is_same_v<T, MethodCallExpr>) {
                     analyzeExpr(*e.object);
                     e.intern_id = rt_.internString(e.method);
-                    e.slot_hint = rt_.getOrAssignFieldSlot(e.intern_id);
                     for (auto& arg : e.args) {
                         analyzeExpr(*arg);
                     }

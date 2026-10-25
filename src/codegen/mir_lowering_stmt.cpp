@@ -516,21 +516,10 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 } else if (!s.path.empty()) {
                     MirValue base = loadVar(st, s.root_symbol_id, s.path[0], 0);
                     for (size_t i = 1; i + (s.method.empty() ? 1 : 0) < s.path.size(); ++i) {
-                        uint32_t id = rt_.internString(s.path[i]);
-                        int32_t slot = rt_.getOrAssignFieldSlot(id);
-                        BValue* base_bits = emitBox(st, base);
-                        BValue* id_c = b.build_iconst_i32(static_cast<int32_t>(id));
-                        BValue* slot_c = b.build_iconst_i32(slot >= 0 ? slot : static_cast<int32_t>(0xFFFFFFFFu));
-                        base = MirValue{b.build_call("brasslua_rt_table_get_field", Type::i64(), {base_bits, id_c, slot_c}),
-                                        Rep::Boxed};
+                        base = MirValue{emitFieldGet(st, emitBox(st, base), rt_.internString(s.path[i])), Rep::Boxed};
                     }
                     const std::string& final_field = s.method.empty() ? s.path.back() : s.method;
-                    uint32_t fid = rt_.internString(final_field);
-                    int32_t fslot = rt_.getOrAssignFieldSlot(fid);
-                    BValue* base_bits = emitBox(st, base);
-                    BValue* id_c = b.build_iconst_i32(static_cast<int32_t>(fid));
-                    BValue* slot_c = b.build_iconst_i32(fslot >= 0 ? fslot : static_cast<int32_t>(0xFFFFFFFFu));
-                    b.build_call("brasslua_rt_table_set_field", Type::i64(), {base_bits, id_c, slot_c, cl_bits});
+                    emitFieldSet(st, emitBox(st, base), rt_.internString(final_field), cl_bits);
                 }
             } else if constexpr (std::is_same_v<T, ReturnStmt>) {
                 if (st.is_unboxed_variant) {
@@ -583,8 +572,7 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                                     callee != "brasslua_rt_upvalue_get" &&
                                     callee != "brasslua_rt_upvalue_set" &&
                                     callee != "brasslua_rt_closure_new" &&
-                                    callee != "brasslua_rt_table_new" &&
-                                    callee != "brasslua_rt_string_from_id") {
+                                    callee != "brasslua_rt_table_new") {
                                     func_has_multiret_call = true;
                                     break;
                                 }

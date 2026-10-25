@@ -51,6 +51,102 @@ void populateClosureUpvalues(MirModuleLowerer& lowerer, FunctionBuildState& st,
     }
 }
 
+// The boxed-operand form of `+ - * /` and the order comparisons: two inline
+// integers (integer ops other than `/`), or two numbers of which one is a
+// float, are done here; anything else (a big or boxed integer result, strings,
+// metamethods) calls `rt_fn`, the runtime's whole operator. Arithmetic gives a
+// boxed result, a comparison a BoolBit.
+MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, BinOp op,
+                            BValue* la, BValue* rb, const char* rt_fn) {
+    auto& b = st.builder;
+    const bool is_cmp = op == BinOp::Lt || op == BinOp::Le || op == BinOp::Gt || op == BinOp::Ge;
+    Type res_ty = is_cmp ? Type::i32() : Type::i64();
+    BValue* c48 = b.build_iconst_i64(48);
+    BValue* c16 = b.build_iconst_i64(16);
+    BValue* int_tag = b.build_iconst_i64(static_cast<int64_t>(Tag::Int47));
+    BValue* l_int = b.build_eq(b.build_lshr(la, c48), int_tag);
+    BValue* r_int = b.build_eq(b.build_lshr(rb, c48), int_tag);
+
+    BasicBlock* int_bb = st.newBlock("dyn_int");
+    BasicBlock* chk_num_bb = st.newBlock("dyn_chk_num");
+    BasicBlock* flt_bb = st.newBlock("dyn_flt");
+    BasicBlock* slow_bb = st.newBlock("dyn_slow");
+    BasicBlock* merge_bb = st.newBlock("dyn_merge", {res_ty});
+    b.build_br_if(b.build_and(l_int, r_int), op == BinOp::Div ? chk_num_bb : int_bb, chk_num_bb);
+
+    // Two inline integers.
+    b.position_at_end(int_bb);
+    BValue* li = b.build_ashr(b.build_shl(la, c16), c16);
+    BValue* ri = b.build_ashr(b.build_shl(rb, c16), c16);
+    if (is_cmp) {
+        BValue* r = nullptr;
+        switch (op) {
+            case BinOp::Lt: r = b.build_slt(li, ri); break;
+            case BinOp::Le: r = b.build_sle(li, ri); break;
+            case BinOp::Gt: r = b.build_sgt(li, ri); break;
+            default:        r = b.build_sge(li, ri); break;
+        }
+        b.build_br(merge_bb, {r});
+    } else {
+        // Lua integers wrap at 64 bits, so the wrapped product is the answer;
+        // one that does not fit inline is boxed by the runtime's operator.
+        BValue* r = op == BinOp::Add ? b.build_add(li, ri)
+                  : op == BinOp::Sub ? b.build_sub(li, ri)
+                                     : b.build_mul(li, ri);
+        BValue* fits = b.build_eq(b.build_ashr(b.build_shl(r, c16), c16), r);
+        BasicBlock* box_bb = st.newBlock("dyn_int_box");
+        b.build_br_if(fits, box_bb, slow_bb);
+        b.position_at_end(box_bb);
+        BValue* payload = b.build_and(r, b.build_iconst_i64(static_cast<int64_t>(kPayloadMask)));
+        BValue* tag_bits = b.build_iconst_i64(static_cast<int64_t>(static_cast<uint64_t>(Tag::Int47) << kTagShift));
+        b.build_br(merge_bb, {b.build_or(payload, tag_bits)});
+    }
+
+    // Two numbers, at least one a float (or `/`).
+    b.position_at_end(chk_num_bb);
+    BValue* max_num = b.build_iconst_i64(static_cast<int64_t>(kNumberMaxBits));
+    BValue* l_num = b.build_or(b.build_ule(la, max_num), l_int);
+    BValue* r_num = b.build_or(b.build_ule(rb, max_num), r_int);
+    b.build_br_if(b.build_and(l_num, r_num), flt_bb, slow_bb);
+
+    b.position_at_end(flt_bb);
+    BValue* lf = b.build_select(l_int, b.build_sitofp_f64_i64(b.build_ashr(b.build_shl(la, c16), c16)),
+                                b.build_bitcast_f64_i64(la));
+    BValue* rf = b.build_select(r_int, b.build_sitofp_f64_i64(b.build_ashr(b.build_shl(rb, c16), c16)),
+                                b.build_bitcast_f64_i64(rb));
+    if (is_cmp) {
+        BValue* r = nullptr;
+        switch (op) {
+            case BinOp::Lt: r = b.build_slt(lf, rf); break;
+            case BinOp::Le: r = b.build_sle(lf, rf); break;
+            case BinOp::Gt: r = b.build_sgt(lf, rf); break;
+            default:        r = b.build_sge(lf, rf); break;
+        }
+        b.build_br(merge_bb, {r});
+    } else {
+        BValue* r = op == BinOp::Add ? b.build_add(lf, rf)
+                  : op == BinOp::Sub ? b.build_sub(lf, rf)
+                  : op == BinOp::Mul ? b.build_mul(lf, rf)
+                                     : b.build_sdiv(lf, rf);
+        b.build_br(merge_bb, {lowerer.emitBox(st, MirValue{r, Rep::Float64})});
+    }
+
+    b.position_at_end(slow_bb);
+    BValue* slow = nullptr;
+    if (is_cmp) {
+        // a > b is b < a, a >= b is b <= a.
+        const bool swap = op == BinOp::Gt || op == BinOp::Ge;
+        BValue* r = b.build_call(rt_fn, Type::i32(), {swap ? rb : la, swap ? la : rb});
+        slow = b.build_ne(r, b.build_iconst_i32(0));
+    } else {
+        slow = b.build_call(rt_fn, Type::i64(), {la, rb});
+    }
+    b.build_br(merge_bb, {slow});
+
+    b.position_at_end(merge_bb);
+    return MirValue{merge_bb->param(0), is_cmp ? Rep::BoolBit : Rep::Boxed};
+}
+
 } // namespace
 
 MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryExpr& bin, InferredType result_type) {
@@ -177,21 +273,11 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
                                   : b.build_eq(r_i32, b.build_iconst_i32(0));
                     break;
                 case BinOp::Lt:
-                    r_i32 = b.build_call("brasslua_rt_lt", Type::i32(), {la, rb});
-                    bit_res = b.build_ne(r_i32, b.build_iconst_i32(0));
-                    break;
-                case BinOp::Le:
-                    r_i32 = b.build_call("brasslua_rt_le", Type::i32(), {la, rb});
-                    bit_res = b.build_ne(r_i32, b.build_iconst_i32(0));
-                    break;
                 case BinOp::Gt:
-                    r_i32 = b.build_call("brasslua_rt_lt", Type::i32(), {rb, la});
-                    bit_res = b.build_ne(r_i32, b.build_iconst_i32(0));
-                    break;
+                    return emitDynamicNumeric(*this, st, bin.op, la, rb, "brasslua_rt_lt");
+                case BinOp::Le:
                 case BinOp::Ge:
-                    r_i32 = b.build_call("brasslua_rt_le", Type::i32(), {rb, la});
-                    bit_res = b.build_ne(r_i32, b.build_iconst_i32(0));
-                    break;
+                    return emitDynamicNumeric(*this, st, bin.op, la, rb, "brasslua_rt_le");
                 default:
                     break;
             }
@@ -226,7 +312,14 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
         }
     }
 
-    if (lhs_known_num && rhs_known_num) {
+    // Float arithmetic only when the result is a float whatever the integers are:
+    // `/` and `^`, or a side known to be a float (a Number may be an integer).
+    auto known_float = [](const MirValue& v, const Expr& e) {
+        return v.rep == Rep::Float64 || (v.rep == Rep::Boxed && e.inferred_type == InferredType::Float64);
+    };
+    const bool float_result = bin.op == BinOp::Div || bin.op == BinOp::Pow ||
+                              known_float(lhs, *bin.lhs) || known_float(rhs, *bin.rhs);
+    if (lhs_known_num && rhs_known_num && float_result) {
         BValue* lf = emitUnboxFloat64(st, lhs);
         BValue* rf = emitUnboxFloat64(st, rhs);
         switch (bin.op) {
@@ -262,6 +355,9 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
         default: break;
     }
     (void)result_type;
+    if (bin.op == BinOp::Add || bin.op == BinOp::Sub || bin.op == BinOp::Mul || bin.op == BinOp::Div) {
+        return emitDynamicNumeric(*this, st, bin.op, la, rb, rt_fn);
+    }
     return MirValue{b.build_call(rt_fn, Type::i64(), {la, rb}), Rep::Boxed};
 }
 
@@ -491,40 +587,48 @@ MirValue MirModuleLowerer::lowerMethodCallExpr(FunctionBuildState& st, const Met
     MirValue obj_mv = lowerExpr(st, *mcall.object);
     BValue* obj_bits = emitBox(st, obj_mv);
     uint32_t id = mcall.intern_id != 0 ? mcall.intern_id : rt_.internString(mcall.method);
-    int32_t slot = mcall.slot_hint >= 0 ? mcall.slot_hint : rt_.findFieldSlot(id);
 
+    // The arguments with the receiver first, as the method is called.
     bool last_is_multiret = !mcall.args.empty() && isCallOrVararg(*mcall.args.back());
-    size_t fixed_count = last_is_multiret ? (mcall.args.size() - 1) : mcall.args.size();
-    BValue* arg_buf = fixed_count > 0
-                          ? st.emitEntryAlloca(static_cast<uint32_t>(fixed_count * 8), 8)
-                          : b.build_iconst_i64(0);
-    for (size_t i = 0; i < fixed_count; ++i) {
-        MirValue amv = lowerExpr(st, *mcall.args[i]);
+    size_t fixed_count = (last_is_multiret ? (mcall.args.size() - 1) : mcall.args.size()) + 1;
+    BValue* arg_buf = st.emitEntryAlloca(static_cast<uint32_t>(fixed_count * 8), 8);
+    b.build_store(Type::i64(), arg_buf, 0, obj_bits);
+    for (size_t i = 1; i < fixed_count; ++i) {
+        MirValue amv = lowerExpr(st, *mcall.args[i - 1]);
         BValue* abits = emitBox(st, amv);
         b.build_store(Type::i64(), arg_buf, static_cast<int32_t>(i * 8), abits);
     }
-
-    BValue* id_c = b.build_iconst_i32(static_cast<int32_t>(id));
-    BValue* slot_c = b.build_iconst_i32(slot >= 0 ? slot : static_cast<int32_t>(0xFFFFFFFFu));
-    BValue* fixed_c = b.build_iconst_i64(static_cast<int64_t>(fixed_count));
-
-    BValue* res = nullptr;
     if (last_is_multiret) {
         (void)lowerMultiExpr(st, *mcall.args.back());
-        res = b.build_call("brasslua_rt_call_method_multiret", Type::i64(),
-                           {obj_bits, id_c, slot_c, arg_buf, fixed_c});
-    } else {
-        res = b.build_call("brasslua_rt_call_method", Type::i64(),
-                           {obj_bits, id_c, slot_c, arg_buf, fixed_c});
     }
+    BValue* fixed_c = b.build_iconst_i64(static_cast<int64_t>(fixed_count));
 
-    if (fixed_count > 0) {
-        BValue* zero = b.build_iconst_i64(0);
-        for (size_t i = 0; i < fixed_count; ++i) {
-            b.build_store(Type::i64(), arg_buf, static_cast<int32_t>(i * 8), zero);
-        }
+    // A Lua table holding the method, or whose table __index does: call it
+    // here. Anything else (a host object's method, a function __index) is
+    // the runtime's.
+    BasicBlock* hit_bb = st.newBlock("mcall_hit", {Type::i64()});
+    BasicBlock* slow_bb = st.newBlock("mcall_slow");
+    BasicBlock* merge_bb = st.newBlock("mcall_merge", {Type::i64()});
+    emitFieldProbe(st, obj_bits, id, /*through_index=*/true, /*nil_is_hit=*/false, hit_bb, slow_bb);
+
+    b.position_at_end(hit_bb);
+    BValue* fast_res = last_is_multiret
+        ? b.build_call("brasslua_rt_call_multiret", Type::i64(), {hit_bb->param(0), arg_buf, fixed_c})
+        : b.build_call("brasslua_rt_call", Type::i64(), {hit_bb->param(0), arg_buf, fixed_c});
+    b.build_br(merge_bb, {fast_res});
+
+    b.position_at_end(slow_bb);
+    BValue* key_c = emitStringConst(st, id);
+    BValue* slow_res = b.build_call(last_is_multiret ? "brasslua_rt_call_method_multiret" : "brasslua_rt_call_method",
+                                    Type::i64(), {obj_bits, key_c, arg_buf, fixed_c});
+    b.build_br(merge_bb, {slow_res});
+
+    b.position_at_end(merge_bb);
+    BValue* zero = b.build_iconst_i64(0);
+    for (size_t i = 0; i < fixed_count; ++i) {
+        b.build_store(Type::i64(), arg_buf, static_cast<int32_t>(i * 8), zero);
     }
-    return MirValue{res, Rep::Boxed};
+    return MirValue{merge_bb->param(0), Rep::Boxed};
 }
 
 MirValue MirModuleLowerer::lowerExpr(FunctionBuildState& st, const Expr& expr) {
@@ -543,8 +647,7 @@ MirValue MirModuleLowerer::lowerExpr(FunctionBuildState& st, const Expr& expr) {
                 return MirValue{b.build_fconst_f64(e.value), Rep::Float64};
             } else if constexpr (std::is_same_v<T, StringExpr>) {
                 uint32_t id = e.intern_id != 0 ? e.intern_id : rt_.internString(e.value);
-                BValue* id_c = b.build_iconst_i32(static_cast<int32_t>(id));
-                return MirValue{b.build_call("brasslua_rt_string_from_id", Type::i64(), {id_c}), Rep::Boxed};
+                return MirValue{emitStringConst(st, id), Rep::Boxed};
             } else if constexpr (std::is_same_v<T, VarargExpr>) {
                 if (st.args_ptr_arg != nullptr) {
                     BValue* off_v = b.build_iconst_i64(static_cast<int64_t>(st.vararg_offset));

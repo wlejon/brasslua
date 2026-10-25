@@ -58,13 +58,6 @@ void brasslua_rt_set_global(uint32_t intern_id, uint64_t val) {
     }
 }
 
-uint64_t brasslua_rt_string_from_id(uint32_t intern_id) {
-    auto& rt = RuntimeState::current();
-    LuaString* s = rt.getLuaStringById(intern_id);
-    if (!s) return kNilBits;
-    return Value::fromString(s).rawBits();
-}
-
 uint64_t brasslua_rt_concat(uint64_t a, uint64_t b) {
     auto& rt = RuntimeState::current();
     Value va(a), vb(b);
@@ -310,44 +303,33 @@ uint64_t brasslua_rt_call_multiret(uint64_t callee, const uint64_t* prefix_args,
     return brasslua_rt_call(callee, full_args, static_cast<int64_t>(total));
 }
 
-uint64_t brasslua_rt_call_method(uint64_t obj, uint32_t method_intern_id, uint32_t slot_hint,
-                                 const uint64_t* args, int64_t nargs) {
+uint64_t brasslua_rt_call_method(uint64_t obj, uint64_t method_key, const uint64_t* args, int64_t nargs) {
     auto& rt = RuntimeState::current();
     // Rule 6: When calling a method on a host object (`obj:m(x)`), pass `obj` as the
-    // explicit receiver (`this`) and `(x)` as the arguments!
+    // explicit receiver (`this`) and `(x)` as the arguments! (args[0] is obj.)
     if (rt.hostBridge().isHostObject && rt.hostBridge().isHostObject(obj)) {
-        std::string_view mname = rt.getStringById(method_intern_id);
+        std::string_view mname = valueToStringView(rt, Value(method_key));
+        const size_t host_nargs = nargs > 0 ? static_cast<size_t>(nargs - 1) : 0;
         if (rt.hostBridge().callMethod) {
             rt.clearMultiRet();
-            uint64_t r0 = rt.hostBridge().callMethod(obj, mname, args, static_cast<size_t>(nargs));
+            uint64_t r0 = rt.hostBridge().callMethod(obj, mname, args + 1, host_nargs);
             if (!rt.isMultiRetSet()) rt.setMultiRet(&r0, 1);
             return r0;
         }
         if (rt.hostBridge().getProperty && rt.hostBridge().callHost) {
             uint64_t fn = rt.hostBridge().getProperty(obj, mname);
             rt.clearMultiRet();
-            uint64_t r0 = rt.hostBridge().callHost(fn, obj, args, static_cast<size_t>(nargs));
+            uint64_t r0 = rt.hostBridge().callHost(fn, obj, args + 1, host_nargs);
             if (!rt.isMultiRetSet()) rt.setMultiRet(&r0, 1);
             return r0;
         }
     }
-    // Pure Lua table/value: look up `obj[method]` and pass `obj` as `self` (arg 1).
-    uint64_t callee = brasslua_rt_table_get_field(obj, method_intern_id, slot_hint);
-    uint64_t stack_buf[8];
-    std::vector<uint64_t> heap_buf;
-    uint64_t* full_args = stack_buf;
-    if (nargs + 1 > 8) {
-        heap_buf.resize(static_cast<size_t>(nargs + 1));
-        full_args = heap_buf.data();
-    }
-    full_args[0] = obj;
-    for (int64_t i = 0; i < nargs; ++i) {
-        full_args[i + 1] = args[i];
-    }
-    return brasslua_rt_call(callee, full_args, nargs + 1);
+    // Pure Lua table/value: look up `obj[method]` and call it with `obj` as `self` (arg 1).
+    uint64_t callee = brasslua_rt_table_get_field(obj, method_key);
+    return brasslua_rt_call(callee, args, nargs);
 }
 
-uint64_t brasslua_rt_call_method_multiret(uint64_t obj, uint32_t method_intern_id, uint32_t slot_hint,
+uint64_t brasslua_rt_call_method_multiret(uint64_t obj, uint64_t method_key,
                                           const uint64_t* prefix_args, int64_t prefix_count) {
     auto& rt = RuntimeState::current();
     const size_t tail_count = rt.multiRetCount();
@@ -366,7 +348,7 @@ uint64_t brasslua_rt_call_method_multiret(uint64_t obj, uint32_t method_intern_i
     for (size_t i = 0; i < tail_count; ++i) {
         full_args[pcount + i] = rt.getMultiRet(i);
     }
-    return brasslua_rt_call_method(obj, method_intern_id, slot_hint, full_args, static_cast<int64_t>(total));
+    return brasslua_rt_call_method(obj, method_key, full_args, static_cast<int64_t>(total));
 }
 
 void brasslua_rt_set_multiret(const uint64_t* vals, int64_t count) {

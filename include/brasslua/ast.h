@@ -93,7 +93,6 @@ struct TableField {
     ExprPtr key;       // null for positional list element; StringExpr for record field
     std::string field_name; // non-empty for `name = expr`
     uint32_t intern_id = 0;
-    int32_t slot_hint = -1;
     ExprPtr value;
 };
 
@@ -112,7 +111,6 @@ struct FieldExpr {
     ExprPtr table;
     std::string field;
     uint32_t intern_id = 0;
-    int32_t slot_hint = -1;
 };
 
 struct CallExpr {
@@ -124,7 +122,6 @@ struct MethodCallExpr {
     ExprPtr object;
     std::string method;
     uint32_t intern_id = 0;
-    int32_t slot_hint = -1;
     std::vector<ExprPtr> args;
 };
 

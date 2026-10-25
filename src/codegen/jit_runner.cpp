@@ -35,8 +35,8 @@ void registerBrassLuaRuntimeSymbols(brass::codegen::JitExecutionEngine& engine) 
     reg("brasslua_rt_table_set", &brasslua_rt_table_set, Type::i64(), {Type::i64(), Type::i64(), Type::i64()});
     reg("brasslua_rt_table_get_int", &brasslua_rt_table_get_int, Type::i64(), {Type::i64(), Type::i64()});
     reg("brasslua_rt_table_set_int", &brasslua_rt_table_set_int, Type::i64(), {Type::i64(), Type::i64(), Type::i64()});
-    reg("brasslua_rt_table_get_field", &brasslua_rt_table_get_field, Type::i64(), {Type::i64(), Type::i32(), Type::i32()});
-    reg("brasslua_rt_table_set_field", &brasslua_rt_table_set_field, Type::i64(), {Type::i64(), Type::i32(), Type::i32(), Type::i64()});
+    reg("brasslua_rt_table_get_field", &brasslua_rt_table_get_field, Type::i64(), {Type::i64(), Type::i64()});
+    reg("brasslua_rt_table_set_field", &brasslua_rt_table_set_field, Type::i64(), {Type::i64(), Type::i64(), Type::i64()});
     reg("brasslua_rt_table_append_multiret", &brasslua_rt_table_append_multiret, Type::i64(), {Type::i64(), Type::i64()});
     reg("brasslua_rt_table_len", &brasslua_rt_table_len, Type::i64(), {Type::i64()});
     reg("brasslua_rt_rawget", &brasslua_rt_rawget, Type::i64(), {Type::i64(), Type::i64()});
@@ -46,7 +46,6 @@ void registerBrassLuaRuntimeSymbols(brass::codegen::JitExecutionEngine& engine) 
     reg("brasslua_rt_get_global", &brasslua_rt_get_global, Type::i64(), {Type::i32()});
     reg("brasslua_rt_set_global", &brasslua_rt_set_global, Type::void_type(), {Type::i32(), Type::i64()});
 
-    reg("brasslua_rt_string_from_id", &brasslua_rt_string_from_id, Type::i64(), {Type::i32()});
     reg("brasslua_rt_box_int64", &brasslua_rt_box_int64, Type::i64(), {Type::i64()});
     reg("brasslua_rt_concat", &brasslua_rt_concat, Type::i64(), {Type::i64(), Type::i64()});
     reg("brasslua_rt_obj_len", &brasslua_rt_obj_len, Type::i64(), {Type::i64()});
@@ -64,8 +63,8 @@ void registerBrassLuaRuntimeSymbols(brass::codegen::JitExecutionEngine& engine) 
     reg("brasslua_rt_call_3", &brasslua_rt_call_3, Type::i64(), {Type::i64(), Type::i64(), Type::i64(), Type::i64()});
     reg("brasslua_rt_call_4", &brasslua_rt_call_4, Type::i64(), {Type::i64(), Type::i64(), Type::i64(), Type::i64(), Type::i64()});
     reg("brasslua_rt_call_multiret", &brasslua_rt_call_multiret, Type::i64(), {Type::i64(), Type::ptr(), Type::i64()});
-    reg("brasslua_rt_call_method", &brasslua_rt_call_method, Type::i64(), {Type::i64(), Type::i32(), Type::i32(), Type::ptr(), Type::i64()});
-    reg("brasslua_rt_call_method_multiret", &brasslua_rt_call_method_multiret, Type::i64(), {Type::i64(), Type::i32(), Type::i32(), Type::ptr(), Type::i64()});
+    reg("brasslua_rt_call_method", &brasslua_rt_call_method, Type::i64(), {Type::i64(), Type::i64(), Type::ptr(), Type::i64()});
+    reg("brasslua_rt_call_method_multiret", &brasslua_rt_call_method_multiret, Type::i64(), {Type::i64(), Type::i64(), Type::ptr(), Type::i64()});
     reg("brasslua_rt_set_multiret", &brasslua_rt_set_multiret, Type::void_type(), {Type::ptr(), Type::i64()});
     reg("brasslua_rt_clear_multiret", &brasslua_rt_clear_multiret, Type::void_type(), {});
     reg("brasslua_rt_prepend_multiret", &brasslua_rt_prepend_multiret, Type::i64(), {Type::ptr(), Type::i64()});

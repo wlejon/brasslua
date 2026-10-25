@@ -64,7 +64,6 @@ struct LuaRuntimeError : public std::runtime_error {
 // Internal runtime helpers shared across runtime_*.cpp and stdlib_*.cpp
 bool isClosurePtr(RuntimeState& rt, const void* ptr) noexcept;
 bool isUpvaluePtr(RuntimeState& rt, const void* ptr) noexcept;
-uint32_t getSlotInternId(const RuntimeState& rt, uint32_t slot) noexcept;
 void setStringMetatable(RuntimeState& rt, LuaTable* mt) noexcept;
 LuaTable* getStringMetatable(RuntimeState& rt) noexcept;
 
@@ -75,6 +74,9 @@ void recomputeMetatableFlags(RuntimeState& rt, LuaTable* tbl);
 uint32_t getOrComputeMetatableFlags(RuntimeState& rt, LuaTable* mt);
 Value lookupMetamethod(RuntimeState& rt, Value obj, std::string_view event);
 void armTableFinalizerIfNeeded(RuntimeState& rt, LuaTable* tbl);
+// The capacity allocTable gives the hash part of a table made for `entries`
+// keys (0 for none): a power of two at least twice the keys.
+uint32_t tableHashCapFor(uint32_t entries) noexcept;
 // The raw length `#t` (a border, no __len): O(1) when array_len still names
 // one, else a binary search of the array part. Keeps array_len as the hint.
 int64_t rawTableLength(LuaTable* tbl) noexcept;

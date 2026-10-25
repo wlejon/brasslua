@@ -97,15 +97,11 @@ bool isJsArray(bronze::Value v) {
 }
 
 // Inspects whether a LuaTable is a plain 1-based sequence table (no metatable,
-// no inline record slots set, no hash entries set, and contiguous 1..N elements
-// with N >= 1).
+// no hash entries set, and contiguous 1..N elements with N >= 1).
 bool isPlainSequenceTable(const LuaTable* tbl, uint32_t& out_len) noexcept {
     out_len = 0;
     if (!tbl || tbl->metatable != nullptr) return false;
-    for (size_t s = 0; s < LuaTable::kInlineSlots; ++s) {
-        if (!Value(tbl->slots[s]).isNil()) return false;
-    }
-    for (uint32_t h = 0; h < tbl->hash_len; ++h) {
+    for (uint32_t h = 0; h < tbl->hash_cap; ++h) {
         if (!Value(tbl->hash_data[h].key).isNil() && !Value(tbl->hash_data[h].val).isNil()) {
             return false;
         }
@@ -140,10 +136,7 @@ void resumeSuspendedCoroutineForAwait(const std::shared_ptr<AwaitState>& state) 
 
     Value coro_tbl = state->rt->getGlobal("coroutine");
     if (!coro_tbl.isTable()) return;
-    uint32_t resume_id = state->rt->internString("resume");
-    uint64_t resume_fn = brasslua_rt_table_get_field(
-        coro_tbl.rawBits(), resume_id,
-        static_cast<uint32_t>(state->rt->findFieldSlot(resume_id)));
+    uint64_t resume_fn = brasslua_rt_table_get_field(coro_tbl.rawBits(), state->rt->makeStringValue("resume"));
     if (Value(resume_fn).isFunction()) {
         brasslua_rt_call_1(resume_fn, Value::fromCoroutine(co).rawBits());
     }
@@ -208,10 +201,7 @@ uint64_t luaAwaitPromise(void* /*cl*/, const uint64_t* args, int64_t nargs) {
             state->suspended_coro = running;
             Value coro_tbl = rt.getGlobal("coroutine");
             if (coro_tbl.isTable()) {
-                uint32_t yield_id = rt.internString("yield");
-                uint64_t yield_fn = brasslua_rt_table_get_field(
-                    coro_tbl.rawBits(), yield_id,
-                    static_cast<uint32_t>(rt.findFieldSlot(yield_id)));
+                uint64_t yield_fn = brasslua_rt_table_get_field(coro_tbl.rawBits(), rt.makeStringValue("yield"));
                 if (Value(yield_fn).isFunction()) {
                     brasslua_rt_call_0(yield_fn);
                 }

@@ -131,11 +131,7 @@ uint64_t rawTableGet(RuntimeState& rt, LuaTable* tbl, uint64_t key_bits) {
     if (k.isNil()) return kNilBits;
 
     if (k.isString()) {
-        auto* s = static_cast<const LuaString*>(k.asPointer());
-        if (static_cast<uint32_t>(s->slot_id) < LuaTable::kInlineSlots) {
-            return tbl->slots[s->slot_id];
-        }
-        return hashTableGet(tbl, key_bits, s->hash);
+        return hashTableGet(tbl, key_bits, static_cast<const LuaString*>(k.asPointer())->hash);
     }
 
     int64_t idx = 0;
@@ -159,18 +155,10 @@ void rawTableSet(RuntimeState& rt, LuaTable* tbl, uint64_t key_bits, uint64_t va
     }
 
     if (k.isString()) {
+        // Any string store may change a metamethod of a table used as a
+        // metatable; compiled code never stores a "__" field inline.
         tbl->cached_mt_flags = 0;
-        auto* s = static_cast<const LuaString*>(k.asPointer());
-        int32_t slot = s->slot_id;
-        if (slot == -1) {
-            slot = rt.getOrAssignFieldSlot(s->intern_id);
-        }
-        if (static_cast<uint32_t>(slot) < LuaTable::kInlineSlots) {
-            tbl->slots[slot] = val_bits;
-            rt.heap().write_barrier(reinterpret_cast<uintptr_t>(tbl), val_bits);
-            return;
-        }
-        hashTableSet(rt, tbl, key_bits, val_bits, s->hash);
+        hashTableSet(rt, tbl, key_bits, val_bits, static_cast<const LuaString*>(k.asPointer())->hash);
         return;
     }
 
@@ -376,16 +364,15 @@ std::string valueToStdString(RuntimeState& rt, Value v) {
         return std::to_string(v.asInt64());
     }
     if (v.isFloat()) {
+        // Lua 5.4's lua_Number format: "%.14g", and ".0" after one that reads as an integer.
         double d = v.asDouble();
-        if (std::isnan(d)) return "-nan";
+        if (std::isnan(d)) return std::signbit(d) ? "-nan" : "nan";
         if (std::isinf(d)) return d > 0 ? "inf" : "-inf";
-        int64_t iv = 0;
-        if (tryConvertFloatToExactInt64(d, iv) && std::fabs(d) < 1e14) {
-            return std::to_string(iv);
-        }
         char buf[64];
         std::snprintf(buf, sizeof(buf), "%.14g", d);
-        return std::string(buf);
+        std::string s(buf);
+        if (s.find_first_of(".eE") == std::string::npos) s += ".0";
+        return s;
     }
     if (v.isTable() || v.isFullUserdata()) {
         Value mm = lookupMetamethod(rt, v, "__tostring");
@@ -432,13 +419,7 @@ Value makeNativeClosure(RuntimeState& rt, LuaNativeFn fn, uint32_t arity) {
 }
 
 void setTableFieldStr(RuntimeState& rt, LuaTable* tbl, std::string_view key, Value val) {
-    uint32_t id = rt.internString(key);
-    int32_t slot = rt.findFieldSlot(id);
-    brasslua_rt_table_set_field(
-        Value::fromTable(tbl).rawBits(),
-        id,
-        slot >= 0 ? static_cast<uint32_t>(slot) : 0xFFFFFFFFu,
-        val.rawBits());
+    brasslua_rt_table_set_field(Value::fromTable(tbl).rawBits(), rt.makeStringValue(key), val.rawBits());
 }
 
 uint64_t returnMulti(RuntimeState& rt, const std::vector<uint64_t>& vals) {
@@ -661,62 +642,34 @@ uint64_t brasslua_rt_table_set_int(uint64_t table, int64_t idx, uint64_t val) {
     return brasslua_rt_table_set(table, Value::fromInt64(idx).rawBits(), val);
 }
 
-uint64_t brasslua_rt_table_get_field(uint64_t table, uint32_t intern_id, uint32_t slot_hint) {
-    auto& rt = RuntimeState::current();
+uint64_t brasslua_rt_table_get_field(uint64_t table, uint64_t key) {
     Value tv(table);
     if (tv.isTable()) {
         auto* tbl = static_cast<LuaTable*>(tv.asPointer());
-        uint64_t own = kNilBits;
-        if (slot_hint < LuaTable::kInlineSlots) {
-            own = tbl->slots[slot_hint];
-        } else {
-            LuaString* s = rt.getLuaStringById(intern_id);
-            if (!s) return kNilBits;
-            own = hashTableGet(tbl, Value::fromString(s).rawBits(), s->hash);
-        }
+        const uint32_t hash = static_cast<const LuaString*>(Value(key).asPointer())->hash;
+        uint64_t own = hashTableGet(tbl, key, hash);
         if (!Value(own).isNil() || (tbl->flags & kMetaIndex) == 0) {
             return own;
         }
         // Fast single-hop metatable table __index (standard Lua OOP `Class.__index = Class`)
-        if ((tbl->flags & kMetaIndex) != 0 && tbl->metatable) {
+        if (tbl->metatable) {
+            auto& rt = RuntimeState::current();
             getOrComputeMetatableFlags(rt, tbl->metatable);
             Value idx_mm(tbl->metatable->cached_index_mm);
             if (idx_mm.isTable()) {
                 auto* idx_tbl = static_cast<LuaTable*>(idx_mm.asPointer());
-                uint64_t v = kNilBits;
-                if (slot_hint < LuaTable::kInlineSlots) {
-                    v = idx_tbl->slots[slot_hint];
-                } else {
-                    LuaString* s = rt.getLuaStringById(intern_id);
-                    if (s) v = hashTableGet(idx_tbl, Value::fromString(s).rawBits(), s->hash);
-                }
+                uint64_t v = hashTableGet(idx_tbl, key, hash);
                 if (!Value(v).isNil() || (idx_tbl->flags & kMetaIndex) == 0) {
                     return v;
                 }
             }
         }
     }
-    LuaString* s = rt.getLuaStringById(intern_id);
-    if (!s) return kNilBits;
-    return brasslua_rt_table_get(table, Value::fromString(s).rawBits());
+    return brasslua_rt_table_get(table, key);
 }
 
-uint64_t brasslua_rt_table_set_field(uint64_t table, uint32_t intern_id, uint32_t slot_hint, uint64_t val) {
-    Value tv(table);
-    if (tv.isTable()) {
-        auto* tbl = static_cast<LuaTable*>(tv.asPointer());
-        if ((tbl->flags & kMetaNewIndex) == 0 && slot_hint < LuaTable::kInlineSlots) {
-            tbl->slots[slot_hint] = val;
-            RuntimeState::current().heap().write_barrier(reinterpret_cast<uintptr_t>(tbl), val);
-            return table;
-        }
-    }
-    auto& rt = RuntimeState::current();
-    LuaString* s = rt.getLuaStringById(intern_id);
-    if (!s) {
-        return table;
-    }
-    return brasslua_rt_table_set(table, Value::fromString(s).rawBits(), val);
+uint64_t brasslua_rt_table_set_field(uint64_t table, uint64_t key, uint64_t val) {
+    return brasslua_rt_table_set(table, key, val);
 }
 
 uint64_t brasslua_rt_table_append_multiret(uint64_t table, int64_t start_idx) {
@@ -762,21 +715,6 @@ uint64_t brasslua_rt_next(uint64_t table, uint64_t key, uint64_t* out_val) {
         return kNilBits;
     };
 
-    auto nextFromSlots = [&](uint32_t start_slot) -> uint64_t {
-        for (uint32_t s = start_slot; s < LuaTable::kInlineSlots; ++s) {
-            uint64_t v = tbl->slots[s];
-            if (!Value(v).isNil()) {
-                uint32_t id = getSlotInternId(rt, s);
-                LuaString* lstr = rt.getLuaStringById(id);
-                if (lstr) {
-                    if (out_val) *out_val = v;
-                    return Value::fromString(lstr).rawBits();
-                }
-            }
-        }
-        return kNilBits;
-    };
-
     auto nextFromHash = [&](uint32_t start_h) -> uint64_t {
         for (uint32_t h = start_h; h < tbl->hash_cap; ++h) {
             const auto& entry = tbl->hash_data[h];
@@ -792,8 +730,6 @@ uint64_t brasslua_rt_next(uint64_t table, uint64_t key, uint64_t* out_val) {
     if (kv.isNil()) {
         uint64_t r = nextFromArray(0);
         if (!Value(r).isNil()) return r;
-        r = nextFromSlots(0);
-        if (!Value(r).isNil()) return r;
         return nextFromHash(0);
     }
 
@@ -801,19 +737,7 @@ uint64_t brasslua_rt_next(uint64_t table, uint64_t key, uint64_t* out_val) {
     if (tryExtractArrayIndex(kv, idx) && idx >= 1 && static_cast<uint64_t>(idx) <= tbl->array_cap) {
         uint64_t r = nextFromArray(static_cast<uint32_t>(idx));
         if (!Value(r).isNil()) return r;
-        r = nextFromSlots(0);
-        if (!Value(r).isNil()) return r;
         return nextFromHash(0);
-    }
-
-    if (kv.isString()) {
-        auto* s = static_cast<const LuaString*>(kv.asPointer());
-        int32_t slot = s->slot_id;
-        if (slot >= 0 && slot < static_cast<int32_t>(LuaTable::kInlineSlots)) {
-            uint64_t r = nextFromSlots(static_cast<uint32_t>(slot + 1));
-            if (!Value(r).isNil()) return r;
-            return nextFromHash(0);
-        }
     }
 
     if (tbl->hash_cap > 0) {

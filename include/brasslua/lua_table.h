@@ -10,7 +10,7 @@ struct alignas(8) LuaString {
     uint32_t hash = 0;
     uint32_t length = 0;
     uint32_t intern_id = 0;
-    int32_t  slot_id = -1; // Cached inline slot index (0..15), -1 if unassigned, -2 if hash-only
+    uint32_t reserved = 0;
     char data[]; // NUL-terminated 8-bit clean bytes (may contain embedded NULs)
 };
 
@@ -21,47 +21,51 @@ struct alignas(8) LuaHashEntry {
     uint64_t val = kNilBits;
 };
 
-// Fixed-offset hybrid Lua 5.4 table allocated on brass::gc::Heap:
-// 1. Contiguous 0-based `array_data` pointer (where Lua index `i` is `array_data[i - 1]`).
-// 2. 16 inline record slots (`slots[16]`) at fixed offset 32 for O(1) zero-hash field loads/stores.
-// 3. Open-addressed power-of-2 `hash_data` table for arbitrary dynamic keys beyond the 16 inline slots.
-// 4. 4 inline array elements (`inline_array[4]`) so small arrays `{a, b}` need 0 extra allocations.
-struct alignas(8) LuaTable {
-    static constexpr size_t kInlineSlots = 16;
-    static constexpr uint32_t kInlineArrayCap = 4;
+// The hash part of a table with none: a one-entry, never-written array, so
+// compiled code probes `hash_data[hash & hash_mask]` with no capacity check.
+extern const LuaHashEntry kEmptyHashPart[1];
 
-    uint64_t*     array_data = nullptr; // Offset 0:  contiguous storage on brass::gc::Heap for 1..array_cap
-    uint32_t      array_cap  = 0;       // Offset 8:  allocated capacity of array_data
-    uint32_t      array_len  = 0;       // Offset 12: high-water contiguous 1..N length
-    uint32_t      shape_id   = 0;       // Offset 16: shape identifier for record fields
+// A Lua 5.4 table allocated on brass::gc::Heap:
+// 1. Contiguous 0-based `array_data` (Lua index `i` is `array_data[i - 1]`).
+// 2. Open-addressed power-of-2 `hash_data` (linear probing, load factor <= 1/2)
+//    for every other key, string fields included. Compiled code reads a field
+//    with a constant key by probing `hash_data[key.hash & hash_mask]` once.
+// A table built with size hints (a constructor's) carries its first array part
+// and hash part inline after the header, so `{x = 1, y = 2}` is one allocation;
+// growth moves a part out of line for good.
+struct alignas(8) LuaTable {
+    static constexpr uint32_t kMaxInlineArray = 64;
+    static constexpr uint32_t kMaxInlineHash = 64;
+
+    uint64_t*     array_data = nullptr; // Offset 0:  storage for 1..array_cap (inline or on the heap)
+    uint32_t      array_cap  = 0;       // Offset 8:  capacity of array_data
+    uint32_t      array_len  = 0;       // Offset 12: hint for the border (see rawTableLength)
+    uint32_t      hash_mask  = 0;       // Offset 16: hash_cap - 1, or 0 with no hash part
     uint32_t      flags      = 0;       // Offset 20: metamethod bitmask (0 = no metatable/metamethods)
     LuaTable*     metatable  = nullptr; // Offset 24: metatable pointer
-    uint64_t      slots[kInlineSlots];  // Offset 32..159: 16 inline record field slots
-    LuaHashEntry* hash_data  = nullptr; // Offset 160: open-addressed power-of-2 hash table on brass::gc::Heap
-    uint32_t      hash_len   = 0;       // Offset 168: number of occupied slots (live + tombstones) in hash_data
-    uint32_t      hash_cap   = 0;       // Offset 172: power-of-2 capacity of hash_data
-    uint32_t      cached_mt_flags = 0;  // Offset 176: cached metamethod bitmask when used as a metatable
-    uint32_t      reserved_pad    = 0;  // Offset 180
-    uint64_t      cached_index_mm = kNilBits; // Offset 184: cached __index value when used as a metatable
-    uint64_t      inline_array[kInlineArrayCap]; // Offset 192..223: inline small array storage
+    LuaHashEntry* hash_data  = nullptr; // Offset 32: the hash part, or kEmptyHashPart
+    uint32_t      hash_len   = 0;       // Offset 40: occupied entries (live + tombstones)
+    uint32_t      hash_cap   = 0;       // Offset 44: power-of-2 capacity of hash_data, 0 for none
+    uint32_t      cached_mt_flags = 0;  // Offset 48: cached metamethod bitmask when used as a metatable
+    uint32_t      inline_bytes    = 0;  // Offset 52: bytes of inline storage after the header
+    uint64_t      cached_index_mm = kNilBits; // Offset 56: cached __index value when used as a metatable
 
-    void initInlineSlots() noexcept {
-        for (size_t i = 0; i < kInlineSlots; ++i) {
-            slots[i] = kNilBits;
-        }
-        for (size_t i = 0; i < kInlineArrayCap; ++i) {
-            inline_array[i] = kNilBits;
-        }
+    // Inline storage: the array part's first block, then the hash part's.
+    uint64_t* inlineStorage() noexcept { return reinterpret_cast<uint64_t*>(this + 1); }
+    bool isInline(const void* p) const noexcept {
+        auto a = reinterpret_cast<uintptr_t>(p);
+        auto lo = reinterpret_cast<uintptr_t>(this + 1);
+        return a >= lo && a < lo + inline_bytes;
     }
 };
 
+static_assert(sizeof(LuaTable) == 64, "LuaTable header is 64 bytes");
 static_assert(offsetof(LuaTable, array_data) == 0, "array_data must be at offset 0");
 static_assert(offsetof(LuaTable, array_cap) == 8, "array_cap must be at offset 8");
-static_assert(offsetof(LuaTable, array_len) == 12, "array_len must be at offset 12");
-static_assert(offsetof(LuaTable, shape_id) == 16, "shape_id must be at offset 16");
+static_assert(offsetof(LuaTable, hash_mask) == 16, "hash_mask must be at offset 16");
 static_assert(offsetof(LuaTable, flags) == 20, "flags must be at offset 20");
 static_assert(offsetof(LuaTable, metatable) == 24, "metatable must be at offset 24");
-static_assert(offsetof(LuaTable, slots) == 32, "slots must be at offset 32");
+static_assert(offsetof(LuaTable, hash_data) == 32, "hash_data must be at offset 32");
 
 struct alignas(8) LuaUpvalue {
     uint64_t value = kNilBits;
@@ -88,16 +92,19 @@ enum class CoroutineStatus : uint8_t {
     Dead      = 3,
 };
 
-// Shares the first 32 bytes layout prefix with LuaTable (array_cap=0, flags=non-zero)
-// so any speculative JIT table guard safely takes the slow path without extra checks.
+// Shares LuaTable's first 40 bytes of layout (no array part, an empty hash
+// part, flags with kMetaNonTable) so compiled code that reads an Object-tagged
+// value as a table finds nothing in it and takes the runtime's path.
 struct alignas(8) LuaCoroutine {
     void*           pad_array_data = nullptr; // Offset 0
     uint32_t        pad_array_cap  = 0;       // Offset 8 (always 0)
     uint32_t        pad_array_len  = 0;       // Offset 12 (always 0)
-    uint32_t        coro_id        = 0;       // Offset 16
-    uint32_t        flags          = 1u << 31;// Offset 20 (non-zero so JIT table fast-path skips)
+    uint32_t        pad_hash_mask  = 0;       // Offset 16 (always 0)
+    uint32_t        flags          = 1u << 31;// Offset 20 (kMetaNonTable)
     LuaTable*       metatable      = nullptr; // Offset 24
-    LuaClosure*     entry_closure  = nullptr; // Offset 32
+    const LuaHashEntry* pad_hash_data = kEmptyHashPart; // Offset 32
+    uint32_t        coro_id        = 0;
+    LuaClosure*     entry_closure  = nullptr;
     LuaCoroutine*   caller         = nullptr; // Offset 40
     void*           ctx_state      = nullptr; // Offset 48: heap-allocated CoroutineContext (its brass fiber)
     void (*trace_ctx)(void* ctx_state, void* tracer_ptr) = nullptr;
@@ -105,15 +112,27 @@ struct alignas(8) LuaCoroutine {
     bool            error_occurred = false;
 };
 
+// The same LuaTable prefix as LuaCoroutine's.
 struct alignas(8) LuaUserdata {
     void*     data          = nullptr; // Offset 0: userdata payload or host handle
     uint32_t  pad_array_cap = 0;       // Offset 8 (always 0)
     uint32_t  size          = 0;       // Offset 12: byte size of userdata
-    uint32_t  type_tag      = 0;       // Offset 16: host type tag (e.g. bronze::embed bridge)
-    uint32_t  flags         = 1u << 31;// Offset 20 (non-zero)
+    uint32_t  pad_hash_mask = 0;       // Offset 16 (always 0)
+    uint32_t  flags         = 1u << 31;// Offset 20 (kMetaNonTable)
     LuaTable* metatable     = nullptr; // Offset 24
-    uint64_t  user_value    = kNilBits;// Offset 32: Lua 5.4 uservalue slot
+    const LuaHashEntry* pad_hash_data = kEmptyHashPart; // Offset 32
+    uint32_t  type_tag      = 0;       // host type tag (e.g. bronze::embed bridge)
+    uint64_t  user_value    = kNilBits;// Lua 5.4 uservalue slot
     void (*finalizer)(void* data, uint32_t type_tag) = nullptr;
 };
+
+static_assert(offsetof(LuaCoroutine, pad_hash_mask) == offsetof(LuaTable, hash_mask) &&
+              offsetof(LuaCoroutine, flags) == offsetof(LuaTable, flags) &&
+              offsetof(LuaCoroutine, pad_hash_data) == offsetof(LuaTable, hash_data),
+              "a coroutine reads as a table with nothing in it");
+static_assert(offsetof(LuaUserdata, pad_hash_mask) == offsetof(LuaTable, hash_mask) &&
+              offsetof(LuaUserdata, flags) == offsetof(LuaTable, flags) &&
+              offsetof(LuaUserdata, pad_hash_data) == offsetof(LuaTable, hash_data),
+              "a userdata reads as a table with nothing in it");
 
 } // namespace brasslua

@@ -145,9 +145,9 @@ public:
         return reinterpret_cast<const uint8_t*>(addr)[-1];
     }
 
-    // Float subtype (64-bit IEEE-754 double)
-    constexpr bool isFloat() const noexcept { return bits_ < kNumberMaxBits; }
-    constexpr bool isNumber() const noexcept { return bits_ < kNumberMaxBits; }
+    // Float subtype (64-bit IEEE-754 double; kNumberMaxBits itself is -inf)
+    constexpr bool isFloat() const noexcept { return bits_ <= kNumberMaxBits; }
+    constexpr bool isNumber() const noexcept { return bits_ <= kNumberMaxBits; }
 
     // Integer subtype (48-bit signed inline Int47 OR heap-allocated 64-bit BoxedInt64)
     constexpr bool isInlineInt() const noexcept { return tag() == static_cast<uint16_t>(Tag::Int47); }

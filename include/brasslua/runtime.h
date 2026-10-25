@@ -47,15 +47,11 @@ public:
     void attachExternalHeap(brass::gc::Heap* external_heap);
     void collectGarbage();
 
-    // String interning & field slot assignment (8-bit clean byte strings)
+    // String interning (8-bit clean byte strings)
     uint32_t internString(std::string_view str);
     std::string_view getStringById(uint32_t id) const;
     LuaString* getLuaStringById(uint32_t id);
     uint64_t makeStringValue(std::string_view str);
-
-    // Deterministic inline slot mapping for known record fields (0..15)
-    int32_t getOrAssignFieldSlot(uint32_t intern_id);
-    int32_t findFieldSlot(uint32_t intern_id) const;
 
     // Globals (_ENV)
     void setGlobal(std::string_view name, Value val);

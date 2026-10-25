@@ -171,6 +171,21 @@ public:
     void lowerFieldStore(FunctionBuildState& st, const FieldExpr& fld_expr, MirValue rhs,
                          InferredType target_type = InferredType::Any);
 
+    // Field access at a constant string key (mir_lowering_table.cpp). The
+    // key is an interned string: its Value bits are a constant of the
+    // compiled code. emitFieldProbe branches to `hit_bb(value)` when a Lua
+    // table holds the key with a non-nil value, or, through_index, when the
+    // table's metatable has a table __index (one level) that does; with
+    // nil_is_hit it also takes the key's absence from a table with no __index
+    // to `hit_bb(nil)`. Anything else (another object, a collision in the
+    // first probe, a function __index) goes to miss_bb.
+    brass::Value* emitStringConst(FunctionBuildState& st, uint32_t intern_id);
+    void emitFieldProbe(FunctionBuildState& st, brass::Value* obj_bits, uint32_t intern_id,
+                        bool through_index, bool nil_is_hit,
+                        brass::BasicBlock* hit_bb, brass::BasicBlock* miss_bb);
+    brass::Value* emitFieldGet(FunctionBuildState& st, brass::Value* obj_bits, uint32_t intern_id);
+    void emitFieldSet(FunctionBuildState& st, brass::Value* obj_bits, uint32_t intern_id, brass::Value* val_bits);
+
     // Function lowering
     CompiledFuncSig compileFuncBody(FunctionBuildState* parent_st, const std::string& debug_name,
                                     uint32_t func_symbol_id, const FuncBody& fbody, bool has_implicit_self);

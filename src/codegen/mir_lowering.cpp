@@ -13,8 +13,8 @@ Rep MirModuleLowerer::repForInferredType(InferredType t) noexcept {
         case InferredType::Int64:
             return Rep::Int64;
         case InferredType::Float64:
-        case InferredType::Number:
             return Rep::Float64;
+        // A Number may be an integer, which a float would turn into a float.
         default:
             return Rep::Boxed;
     }
@@ -45,7 +45,6 @@ void MirModuleLowerer::declareRuntimeExternals() {
     decl("brasslua_rt_get_global");
     decl("brasslua_rt_set_global");
 
-    decl("brasslua_rt_string_from_id");
     decl("brasslua_rt_box_int64");
     decl("brasslua_rt_concat");
     decl("brasslua_rt_obj_len");
@@ -109,7 +108,11 @@ BValue* MirModuleLowerer::emitBox(FunctionBuildState& st, MirValue v) {
         return b.build_select(v.val, t_bits, f_bits);
     }
     if (v.rep == Rep::Float64) {
-        return b.build_bitcast_i64_f64(v.val);
+        // A NaN the hardware made (x86's is 0xFFF8...) would read as a tagged
+        // value, so every NaN boxes as the canonical one.
+        BValue* bits = b.build_bitcast_i64_f64(v.val);
+        BValue* is_nan = b.build_ne(v.val, v.val);
+        return b.build_select(is_nan, b.build_iconst_i64(static_cast<int64_t>(kCanonicalNaNBits)), bits);
     }
     // Constant folding for Int64 literals that fit in Tag::Int47
     if (v.val && v.val->is_instruction() &&
@@ -185,10 +188,10 @@ BValue* MirModuleLowerer::emitUnboxFloat64(FunctionBuildState& st, MirValue v) {
     if (v.rep == Rep::Int64) {
         return b.build_sitofp_f64_i64(v.val);
     }
-    // Rep::Boxed -> unboxed double: fast path 1 for IEEE-754 double (< kNumberMaxBits),
+    // Rep::Boxed -> unboxed double: fast path 1 for IEEE-754 double (<= kNumberMaxBits),
     // fast path 2 for Tag::Int47 (0xFFF3), slow path for BoxedInt64/string
     BValue* max_num = b.build_iconst_i64(static_cast<int64_t>(kNumberMaxBits));
-    BValue* is_flt = b.build_ult(v.val, max_num);
+    BValue* is_flt = b.build_ule(v.val, max_num);
 
     BasicBlock* flt_bb = st.newBlock("unbox_f64_flt");
     BasicBlock* check_int_bb = st.newBlock("unbox_f64_chk_int");
@@ -393,11 +396,10 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
     if (allow_unbox) {
         sig.has_unboxed = true;
         sig.unboxed_symbol = sig.boxed_symbol + "_unboxed";
+        // A Number (int or float) param or result passes boxed, keeping its subtype.
         sig.return_rep = repForInferredType(fbody.return_type);
-        if (sig.return_rep == Rep::Boxed) sig.return_rep = Rep::Float64;
         for (size_t i = 0; i < fbody.params.size(); ++i) {
-            Rep pr = i < fbody.param_types.size() ? repForInferredType(fbody.param_types[i]) : Rep::Float64;
-            if (pr == Rep::Boxed) pr = Rep::Float64;
+            Rep pr = i < fbody.param_types.size() ? repForInferredType(fbody.param_types[i]) : Rep::Boxed;
             sig.param_reps.push_back(pr);
         }
     }

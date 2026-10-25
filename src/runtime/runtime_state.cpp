@@ -48,17 +48,12 @@ void traceLuaTable(uintptr_t payload, size_t /*payload_bytes*/, brass::gc::Trace
     const bool weak_k = (tbl->flags & kMetaWeakKeys) != 0;
     const bool weak_v = (tbl->flags & kMetaWeakValues) != 0;
 
-    for (size_t i = 0; i < LuaTable::kInlineSlots; ++i) {
-        if (weak_v && isCollectableWeakObject(tbl->slots[i])) {
-            t.visit_weak(&tbl->slots[i], kNilBits);
-        } else {
-            t.visit(&tbl->slots[i]);
-        }
-    }
     t.visit(&tbl->cached_index_mm);
 
+    // An inline part lives in this (pinned) object, and kEmptyHashPart off the
+    // heap: only an out-of-line part is an object of its own to keep.
     if (tbl->array_data) {
-        if (tbl->array_data != tbl->inline_array) {
+        if (!tbl->isInline(tbl->array_data)) {
             t.visit_address(reinterpret_cast<uintptr_t*>(&tbl->array_data));
         }
         for (uint32_t i = 0; i < tbl->array_cap; ++i) {
@@ -69,8 +64,10 @@ void traceLuaTable(uintptr_t payload, size_t /*payload_bytes*/, brass::gc::Trace
             }
         }
     }
-    if (tbl->hash_data) {
-        t.visit_address(reinterpret_cast<uintptr_t*>(&tbl->hash_data));
+    if (tbl->hash_cap != 0) {
+        if (!tbl->isInline(tbl->hash_data)) {
+            t.visit_address(reinterpret_cast<uintptr_t*>(&tbl->hash_data));
+        }
         for (uint32_t i = 0; i < tbl->hash_cap; ++i) {
             LuaHashEntry& entry = tbl->hash_data[i];
             if (entry.key == kNilBits || entry.key == kTombstoneBits) continue;
@@ -218,9 +215,6 @@ struct RuntimeState::Impl {
 
     std::unordered_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> str_to_id;
     std::vector<LuaString*> id_to_lstr;
-
-    uint32_t slot_to_intern[LuaTable::kInlineSlots] = {0};
-    int32_t next_slot = 0;
 
     std::vector<Value> globals_by_id;
     LuaTable* env_table = nullptr;
@@ -411,10 +405,6 @@ void RuntimeState::reset() {
 
     impl_->str_to_id.clear();
     impl_->id_to_lstr.clear();
-    for (size_t i = 0; i < LuaTable::kInlineSlots; ++i) {
-        impl_->slot_to_intern[i] = 0;
-    }
-    impl_->next_slot = 0;
     impl_->globals_by_id.clear();
     impl_->env_table = nullptr;
     impl_->string_metatable = nullptr;
@@ -425,15 +415,6 @@ void RuntimeState::reset() {
 
     // Reserve intern_id 0 for the empty string ""
     internString("");
-
-    // Pre-seed deterministic inline record field slots (0..15)
-    static constexpr const char* kCommonFields[] = {
-        "x", "y", "z", "vx", "vy", "vz", "mass", "next", "prev", "left", "right", "val", "key"
-    };
-    for (const char* f : kCommonFields) {
-        uint32_t id = internString(f);
-        getOrAssignFieldSlot(id);
-    }
 
     impl_->env_table = allocTable(0, 64);
     registerStdlib();
@@ -458,9 +439,6 @@ uint32_t RuntimeState::internString(std::string_view str) {
     lstr->hash = fnv1aHash(str);
     lstr->length = static_cast<uint32_t>(str.size());
     lstr->intern_id = id;
-    // Never assign inline slots 0..15 to metamethod names ("__*"), so any mutation to a
-    // metamethod goes through hash_data and invalidates cached_mt_flags.
-    lstr->slot_id = (str.size() >= 2 && str[0] == '_' && str[1] == '_') ? -2 : -1;
     if (!str.empty()) {
         std::memcpy(lstr->data, str.data(), str.size());
     }
@@ -490,31 +468,6 @@ uint64_t RuntimeState::makeStringValue(std::string_view str) {
     return Value::fromString(impl_->id_to_lstr[id]).rawBits();
 }
 
-int32_t RuntimeState::getOrAssignFieldSlot(uint32_t intern_id) {
-    if (intern_id >= impl_->id_to_lstr.size()) return -1;
-    LuaString* s = impl_->id_to_lstr[intern_id];
-    if (s->slot_id >= 0) return s->slot_id;
-    if (s->slot_id == -2) return -1;
-    if (s->length >= 2 && s->data[0] == '_' && s->data[1] == '_') {
-        s->slot_id = -2;
-        return -1;
-    }
-    if (impl_->next_slot < static_cast<int32_t>(LuaTable::kInlineSlots)) {
-        int32_t slot = impl_->next_slot++;
-        s->slot_id = slot;
-        impl_->slot_to_intern[slot] = intern_id;
-        return slot;
-    }
-    s->slot_id = -2;
-    return -1;
-}
-
-int32_t RuntimeState::findFieldSlot(uint32_t intern_id) const {
-    if (intern_id >= impl_->id_to_lstr.size()) return -1;
-    int32_t slot = impl_->id_to_lstr[intern_id]->slot_id;
-    return slot >= 0 ? slot : -1;
-}
-
 LuaTable* RuntimeState::envTable() const noexcept {
     return impl_->env_table;
 }
@@ -530,12 +483,8 @@ void RuntimeState::setGlobalById(uint32_t intern_id, Value val) {
     }
     impl_->globals_by_id[intern_id] = val;
     if (impl_->env_table) {
-        int32_t slot = findFieldSlot(intern_id);
-        brasslua_rt_table_set_field(
-            Value::fromTable(impl_->env_table).rawBits(),
-            intern_id,
-            slot >= 0 ? static_cast<uint32_t>(slot) : 0xFFFFFFFFu,
-            val.rawBits());
+        brasslua_rt_table_set_field(Value::fromTable(impl_->env_table).rawBits(),
+                                    Value::fromString(impl_->id_to_lstr[intern_id]).rawBits(), val.rawBits());
     }
 }
 
@@ -571,7 +520,7 @@ Value RuntimeState::getGlobalById(uint32_t intern_id) {
 
 void RuntimeState::ensureTableArrayCapacity(LuaTable* tbl, uint32_t min_cap) {
     if (min_cap <= tbl->array_cap) return;
-    uint32_t new_cap = tbl->array_cap < 16 ? 16 : tbl->array_cap;
+    uint32_t new_cap = tbl->array_cap < 4 ? 4 : tbl->array_cap;
     while (new_cap < min_cap) {
         new_cap *= 2;
     }
@@ -592,9 +541,9 @@ void RuntimeState::ensureTableArrayCapacity(LuaTable* tbl, uint32_t min_cap) {
 }
 
 void RuntimeState::ensureTableHashCapacity(LuaTable* tbl, uint32_t min_entries) {
-    uint32_t required = min_entries < 4 ? 8 : min_entries * 2;
+    uint32_t required = min_entries < 2 ? 4 : min_entries * 2;
     if (required <= tbl->hash_cap) return;
-    uint32_t new_cap = tbl->hash_cap == 0 ? 8 : tbl->hash_cap;
+    uint32_t new_cap = tbl->hash_cap == 0 ? 4 : tbl->hash_cap;
     while (new_cap < required) {
         new_cap *= 2;
     }
@@ -625,20 +574,44 @@ void RuntimeState::ensureTableHashCapacity(LuaTable* tbl, uint32_t min_entries) 
     }
     tbl->hash_data = new_hash;
     tbl->hash_cap = new_cap;
+    tbl->hash_mask = new_cap - 1;
     tbl->hash_len = new_len;
 }
 
+const LuaHashEntry kEmptyHashPart[1] = {};
+
+uint32_t tableHashCapFor(uint32_t entries) noexcept {
+    if (entries == 0) return 0;
+    uint32_t cap = 2;
+    while (cap < entries * 2) cap *= 2;
+    return cap;
+}
+
 LuaTable* RuntimeState::allocTable(uint32_t array_hint, uint32_t hash_hint) {
+    const uint32_t inline_arr = array_hint <= LuaTable::kMaxInlineArray ? array_hint : 0;
+    uint32_t inline_hash = tableHashCapFor(hash_hint);
+    if (inline_hash > LuaTable::kMaxInlineHash) inline_hash = 0;
+    const size_t inline_bytes = size_t{inline_arr} * sizeof(uint64_t) + size_t{inline_hash} * sizeof(LuaHashEntry);
     uintptr_t mem = impl_->active_heap->allocate(
-        sizeof(LuaTable), getLayouts().table, brass::gc::kAllocPinned, kHostKindTable);
+        sizeof(LuaTable) + inline_bytes, getLayouts().table, brass::gc::kAllocPinned, kHostKindTable);
     auto* tbl = new (reinterpret_cast<void*>(mem)) LuaTable();
-    tbl->initInlineSlots();
-    tbl->array_data = tbl->inline_array;
-    tbl->array_cap = LuaTable::kInlineArrayCap;
-    if (array_hint > LuaTable::kInlineArrayCap) {
+    tbl->inline_bytes = static_cast<uint32_t>(inline_bytes);
+    uint64_t* store = tbl->inlineStorage();
+    for (size_t i = 0; i < inline_bytes / sizeof(uint64_t); ++i) {
+        store[i] = kNilBits;
+    }
+    tbl->hash_data = const_cast<LuaHashEntry*>(kEmptyHashPart);
+    if (inline_arr > 0) {
+        tbl->array_data = store;
+        tbl->array_cap = inline_arr;
+    } else if (array_hint > 0) {
         ensureTableArrayCapacity(tbl, array_hint);
     }
-    if (hash_hint > 0) {
+    if (inline_hash > 0) {
+        tbl->hash_data = reinterpret_cast<LuaHashEntry*>(store + inline_arr);
+        tbl->hash_cap = inline_hash;
+        tbl->hash_mask = inline_hash - 1;
+    } else if (hash_hint > 0) {
         ensureTableHashCapacity(tbl, hash_hint);
     }
     return tbl;
@@ -762,11 +735,6 @@ bool isUpvaluePtr(RuntimeState& rt, const void* ptr) noexcept {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
     if (addr == 0 || !rt.heap().contains(addr)) return false;
     return reinterpret_cast<const uint8_t*>(addr)[-1] == kHostKindUpvalue;
-}
-
-uint32_t getSlotInternId(const RuntimeState& rt, uint32_t slot) noexcept {
-    if (slot >= LuaTable::kInlineSlots) return 0;
-    return rt.impl()->slot_to_intern[slot];
 }
 
 void setStringMetatable(RuntimeState& rt, LuaTable* mt) noexcept {

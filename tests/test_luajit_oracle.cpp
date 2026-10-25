@@ -261,6 +261,34 @@ int runLuaOracleTests() {
                 print(dsum)
             )LUA"
         },
+        {
+            "lua54_number_subtypes_nan_inf",
+            "lua5.4",
+            R"LUA(
+                local zero = 0.0
+                local nan = zero / zero
+                print(nan ~= nan, type(nan), math.type(nan))
+                local t = { z = zero, y = 3, f = 2.5 }
+                local tn = t.z / t.z
+                print(tn ~= tn, type(tn))
+                local ninf = -1 / 0
+                print(ninf, type(ninf), ninf < 0, -ninf, t.f + ninf)
+
+                local yes = os.time() > 0
+                local n = (yes and 1 or 2.5) + 1
+                print(n, math.type(n))
+                local k = -(yes and 3 or 1.5)
+                print(k, math.type(k))
+                local q = (yes and 7 or 1.5) // 2
+                print(q, math.type(q))
+                local function twice(a) local s = a * 2 return s end
+                print(twice(4), math.type(twice(4)), twice(1.5))
+
+                print(t.y + t.y, t.y * t.f, t.y / t.y, t.y - 7, t.y < t.f, t.f >= t.y, t.y > t.f)
+                print(math.maxinteger + t.y, t.y * (1 << 46), t.y * (1 << 62), (1 << 47) + t.y - t.y)
+                print(math.type(t.y + t.y), math.type(t.y + t.f), math.type(t.y / t.y))
+            )LUA"
+        },
     };
 
     for (const auto& tc : cases) {
