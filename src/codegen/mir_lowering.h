@@ -28,6 +28,10 @@ enum class Rep : uint8_t {
 struct MirValue {
     brass::Value* val = nullptr;
     Rep rep = Rep::Boxed;
+    // A call that made its one value without the multiret buffer (an
+    // intrinsic, an inlined body, a function's unboxed entry); see
+    // lowerMultiExpr.
+    bool single = false;
 };
 
 struct LocalVarInfo {
@@ -144,6 +148,11 @@ public:
     void lowerStmt(FunctionBuildState& st, const Stmt& stmt);
     void lowerBlockStmts(FunctionBuildState& st, const std::vector<StmtPtr>& stmts);
     MirValue lowerExpr(FunctionBuildState& st, const Expr& expr);
+    // lowerExpr for a call or `...` whose values are then read from the
+    // multiret buffer (the last of a call's arguments or a table's items, the
+    // last of a multiple assignment's values, a generic for's iterator, a
+    // returned call): a call made without the buffer leaves its value there.
+    MirValue lowerMultiExpr(FunctionBuildState& st, const Expr& expr);
     MirValue lowerBinaryExpr(FunctionBuildState& st, const BinaryExpr& bin, InferredType result_type);
     MirValue lowerCallExpr(FunctionBuildState& st, const CallExpr& call, InferredType result_type);
     MirValue lowerMethodCallExpr(FunctionBuildState& st, const MethodCallExpr& mcall);

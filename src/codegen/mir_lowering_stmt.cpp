@@ -129,13 +129,14 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
             using T = std::decay_t<decltype(s)>;
 
             if constexpr (std::is_same_v<T, LocalStmt>) {
-                std::vector<MirValue> init_vals;
-                init_vals.reserve(s.init.size());
-                for (const auto& ie : s.init) {
-                    init_vals.push_back(lowerExpr(st, *ie));
-                }
                 bool expand_last = !s.init.empty() && s.vars.size() > s.init.size() &&
                                    isCallOrVararg(*s.init.back());
+                std::vector<MirValue> init_vals;
+                init_vals.reserve(s.init.size());
+                for (size_t i = 0; i < s.init.size(); ++i) {
+                    const bool multi = expand_last && i + 1 == s.init.size();
+                    init_vals.push_back(multi ? lowerMultiExpr(st, *s.init[i]) : lowerExpr(st, *s.init[i]));
+                }
 
                 for (size_t i = 0; i < s.vars.size(); ++i) {
                     const LocalAttr& vattr = s.vars[i];
@@ -170,13 +171,14 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                     storeVar(st, vattr.name, 0, rhs_mv);
                 }
             } else if constexpr (std::is_same_v<T, AssignStmt>) {
-                std::vector<MirValue> rhs_vals;
-                rhs_vals.reserve(s.values.size());
-                for (const auto& ve : s.values) {
-                    rhs_vals.push_back(lowerExpr(st, *ve));
-                }
                 bool expand_last = !s.values.empty() && s.targets.size() > s.values.size() &&
                                    isCallOrVararg(*s.values.back());
+                std::vector<MirValue> rhs_vals;
+                rhs_vals.reserve(s.values.size());
+                for (size_t i = 0; i < s.values.size(); ++i) {
+                    const bool multi = expand_last && i + 1 == s.values.size();
+                    rhs_vals.push_back(multi ? lowerMultiExpr(st, *s.values[i]) : lowerExpr(st, *s.values[i]));
+                }
 
                 std::vector<MirValue> final_rhs;
                 final_rhs.reserve(s.targets.size());
@@ -425,9 +427,10 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 BValue* ctrl_v = b.build_iconst_i64(static_cast<int64_t>(kNilBits));
 
                 if (!s.iter_exprs.empty()) {
-                    MirValue e0 = lowerExpr(st, *s.iter_exprs[0]);
+                    const bool multi = s.iter_exprs.size() == 1 && isCallOrVararg(*s.iter_exprs[0]);
+                    MirValue e0 = multi ? lowerMultiExpr(st, *s.iter_exprs[0]) : lowerExpr(st, *s.iter_exprs[0]);
                     iter_fn = emitBox(st, e0);
-                    if (s.iter_exprs.size() == 1 && isCallOrVararg(*s.iter_exprs[0])) {
+                    if (multi) {
                         iter_fn = b.build_call("brasslua_rt_get_multiret", Type::i64(), {b.build_iconst_i64(0)});
                         state_v = b.build_call("brasslua_rt_get_multiret", Type::i64(), {b.build_iconst_i64(1)});
                         ctrl_v = b.build_call("brasslua_rt_get_multiret", Type::i64(), {b.build_iconst_i64(2)});
@@ -560,7 +563,7 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
 
                 // Tail call (`return f(...)` or `return obj:m(...)`): forward multi-return buffer untouched
                 if (s.values.size() == 1 && isCallOrVararg(*s.values[0])) {
-                    MirValue mv = lowerExpr(st, *s.values[0]);
+                    MirValue mv = lowerMultiExpr(st, *s.values[0]);
                     BValue* boxed = emitBox(st, mv);
                     b.build_ret(boxed);
                     return;

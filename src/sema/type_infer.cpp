@@ -96,6 +96,9 @@ private:
                     if (e.name == "setmetatable") {
                         uses_metatables_ = true;
                     }
+                    // Named other than as a call's callee: the value may be
+                    // called from anywhere.
+                    value_refs_.insert(e.name);
                 } else if constexpr (std::is_same_v<T, UnaryExpr>) {
                     if (e.op == UnOp::Not) {
                         if (const auto* idx = std::get_if<IndexExpr>(&e.operand->node)) {
@@ -137,7 +140,11 @@ private:
                 } else if constexpr (std::is_same_v<T, FieldExpr>) {
                     prescanExpr(*e.table);
                 } else if constexpr (std::is_same_v<T, CallExpr>) {
-                    prescanExpr(*e.callee);
+                    if (const auto* callee = std::get_if<IdentExpr>(&e.callee->node)) {
+                        if (callee->name == "setmetatable") uses_metatables_ = true;
+                    } else {
+                        prescanExpr(*e.callee);
+                    }
                     for (const auto& a : e.args) prescanExpr(*a);
                 } else if constexpr (std::is_same_v<T, MethodCallExpr>) {
                     prescanExpr(*e.object);
@@ -156,6 +163,11 @@ private:
                     using T = std::decay_t<decltype(s)>;
                     if constexpr (std::is_same_v<T, LocalStmt>) {
                         for (const auto& ie : s.init) prescanExpr(*ie);
+                        for (size_t i = 0; i < s.vars.size() && i < s.init.size(); ++i) {
+                            if (std::holds_alternative<FuncExpr>(s.init[i]->node)) {
+                                ++function_defs_[s.vars[i].name];
+                            }
+                        }
                         for (size_t i = 0; i < s.vars.size() && i < s.init.size(); ++i) {
                             if (const auto* fe = std::get_if<FieldExpr>(&s.init[i]->node)) {
                                 if (const auto* base = std::get_if<IdentExpr>(&fe->table->node)) {
@@ -203,6 +215,9 @@ private:
                         for (const auto& ie : s.iter_exprs) prescanExpr(*ie);
                         prescanStmts(s.body);
                     } else if constexpr (std::is_same_v<T, FuncDefStmt>) {
+                        if (s.path.size() == 1 && s.method.empty()) {
+                            ++function_defs_[s.path[0]];
+                        }
                         prescanStmts(s.func.body);
                     } else if constexpr (std::is_same_v<T, ReturnStmt>) {
                         for (const auto& v : s.values) prescanExpr(*v);
@@ -301,6 +316,9 @@ private:
         size_t total_params = fn.params.size() + (has_implicit_self ? 1 : 0);
         if (fn.param_types.size() < total_params) {
             fn.param_types.resize(total_params, InferredType::Unknown);
+        }
+        if (!func_name.empty() && !callSitesKnown(func_name)) {
+            for (auto& pt : fn.param_types) pt = InferredType::Any;
         }
         pushScope();
         if (has_implicit_self) {
@@ -734,7 +752,7 @@ private:
                                                            InferredType::Unknown);
                             }
                             bool is_self_call = (id->name == current_func_name_);
-                            if (!in_pass1_ || !is_self_call) {
+                            if ((!in_pass1_ || !is_self_call) && callSitesKnown(id->name)) {
                                 for (size_t i = 0; i < target->params.size(); ++i) {
                                     InferredType arg_t =
                                         i < e.args.size() ? e.args[i]->inferred_type : InferredType::Nil;
@@ -784,6 +802,18 @@ private:
     std::unordered_map<std::string, FuncBody*> functions_;
     std::unordered_map<std::string, std::pair<std::string, std::string>> stdlib_aliases_;
     std::unordered_set<std::string> mutated_vars_;
+    // A function's parameter types are the join of its direct calls' argument
+    // types only when those are all its calls: its name is never used as a
+    // value (`local g = f`, an argument, a table item), never assigned, and
+    // names one function. Names are not scoped here, so any use of the name
+    // counts.
+    std::unordered_set<std::string> value_refs_;
+    std::unordered_map<std::string, int> function_defs_;
+    bool callSitesKnown(const std::string& name) const {
+        auto it = function_defs_.find(name);
+        return value_refs_.count(name) == 0 && mutated_vars_.count(name) == 0 &&
+               (it == function_defs_.end() || it->second <= 1);
+    }
     std::unordered_set<std::string> nil_checked_tables_;
     std::unordered_map<std::string, InferredType> field_types_;
     std::unordered_map<std::string, InferredType> table_elem_types_;

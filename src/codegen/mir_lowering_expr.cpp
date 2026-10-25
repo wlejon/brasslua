@@ -325,7 +325,7 @@ MirValue MirModuleLowerer::lowerTableExpr(FunctionBuildState& st, const TableExp
         bool is_multiret_expr = is_last && !f.key && f.value &&
                                 (std::holds_alternative<CallExpr>(f.value->node) ||
                                  std::holds_alternative<MethodCallExpr>(f.value->node));
-        MirValue val_mv = lowerExpr(st, *f.value);
+        MirValue val_mv = is_multiret_expr ? lowerMultiExpr(st, *f.value) : lowerExpr(st, *f.value);
         BValue* val_bits = emitBox(st, val_mv);
 
         if (is_multiret_expr) {
@@ -583,6 +583,17 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
     return MirValue{b.build_call(rt_fn, Type::i64(), {la, rb}), Rep::Boxed};
 }
 
+MirValue MirModuleLowerer::lowerMultiExpr(FunctionBuildState& st, const Expr& expr) {
+    MirValue mv = lowerExpr(st, expr);
+    if (!mv.single) return mv;
+    auto& b = st.builder;
+    BValue* boxed = emitBox(st, mv);
+    BValue* one = st.emitEntryAlloca(8, 8);
+    b.build_store(Type::i64(), one, 0, boxed);
+    b.build_call("brasslua_rt_set_multiret", Type::void_type(), {one, b.build_iconst_i64(1)});
+    return MirValue{boxed, Rep::Boxed};
+}
+
 MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr& call, InferredType /*result_type*/) {
     auto& b = st.builder;
 
@@ -594,12 +605,12 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
                     if (fe->field == "sqrt") {
                         MirValue a0 = lowerExpr(st, *call.args[0]);
                         BValue* f0 = emitUnboxFloat64(st, a0);
-                        return MirValue{b.build_sqrt_f64(f0), Rep::Float64};
+                        return MirValue{b.build_sqrt_f64(f0), Rep::Float64, true};
                     }
                     if (fe->field == "abs" && call.args[0]->inferred_type == InferredType::Float64) {
                         MirValue a0 = lowerExpr(st, *call.args[0]);
                         BValue* f0 = emitUnboxFloat64(st, a0);
-                        return MirValue{b.build_fabs_f64(f0), Rep::Float64};
+                        return MirValue{b.build_fabs_f64(f0), Rep::Float64, true};
                     }
                 }
                 if ((base->name == "bit" || base->name == "bit32") && !call.args.empty()) {
@@ -609,7 +620,7 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
                         return b.build_trunc_i32(i64);
                     };
                     auto sext32 = [&](BValue* v32) -> MirValue {
-                        return MirValue{b.build_sext_i64(v32), Rep::Int64};
+                        return MirValue{b.build_sext_i64(v32), Rep::Int64, true};
                     };
                     if (fe->field == "bnot" && call.args.size() == 1) {
                         BValue* x = argI32(*call.args[0]);
@@ -703,6 +714,7 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
                     MirValue ret_mv = lowerExpr(st, *ret_s->values[0]);
                     MirValue coerced_ret = coerceToRep(st, ret_mv, sig.return_rep);
                     popScope(st);
+                    coerced_ret.single = true;
                     return coerced_ret;
                 }
             }
@@ -714,7 +726,7 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
             }
             Type ret_t = mirTypeForRep(sig.return_rep);
             BValue* res = b.build_call(sig.unboxed_symbol, ret_t, brass::Span<BValue* const>(uargs));
-            return MirValue{res, sig.return_rep};
+            return MirValue{res, sig.return_rep, true};
         }
     }
 
@@ -752,7 +764,7 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
     }
 
     if (last_is_multiret) {
-        (void)lowerExpr(st, *call.args.back());
+        (void)lowerMultiExpr(st, *call.args.back());
         BValue* mcount = b.build_call("brasslua_rt_get_multiret_count", Type::i64());
         BValue* k_slot = st.emitEntryAlloca(8, 8);
         b.build_store(Type::i64(), k_slot, 0, b.build_iconst_i64(0));
@@ -880,23 +892,23 @@ MirValue MirModuleLowerer::lowerExpr(FunctionBuildState& st, const Expr& expr) {
             } else if constexpr (std::is_same_v<T, TableExpr>) {
                 return lowerTableExpr(st, e);
             } else if constexpr (std::is_same_v<T, IndexExpr>) {
+                // A table holds whatever was stored, so the inferred type is
+                // only the likely case: the unbox checks the tag.
                 MirValue mv = lowerIndexLoad(st, e, expr.inferred_type);
                 if (expr.inferred_type == InferredType::Float64 && mv.rep == Rep::Boxed) {
-                    return MirValue{b.build_bitcast_f64_i64(mv.val), Rep::Float64};
+                    return MirValue{emitUnboxFloat64(st, mv), Rep::Float64};
                 }
                 if (expr.inferred_type == InferredType::Int64 && mv.rep == Rep::Boxed) {
-                    BValue* c16 = b.build_iconst_i64(16);
-                    return MirValue{b.build_ashr(b.build_shl(mv.val, c16), c16), Rep::Int64};
+                    return MirValue{emitUnboxInt64(st, mv), Rep::Int64};
                 }
                 return mv;
             } else if constexpr (std::is_same_v<T, FieldExpr>) {
                 MirValue mv = lowerFieldLoad(st, e, expr.inferred_type);
                 if (expr.inferred_type == InferredType::Float64 && mv.rep == Rep::Boxed) {
-                    return MirValue{b.build_bitcast_f64_i64(mv.val), Rep::Float64};
+                    return MirValue{emitUnboxFloat64(st, mv), Rep::Float64};
                 }
                 if (expr.inferred_type == InferredType::Int64 && mv.rep == Rep::Boxed) {
-                    BValue* c16 = b.build_iconst_i64(16);
-                    return MirValue{b.build_ashr(b.build_shl(mv.val, c16), c16), Rep::Int64};
+                    return MirValue{emitUnboxInt64(st, mv), Rep::Int64};
                 }
                 return mv;
             } else if constexpr (std::is_same_v<T, CallExpr>) {
