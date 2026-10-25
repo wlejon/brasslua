@@ -522,6 +522,16 @@ void attachBronzeBridge(RuntimeState& rt) {
         return jsToLua(rt, gv.value).rawBits();
     };
 
+    bridge.setGlobal = [&rt](std::string_view name, uint64_t val) {
+        auto gt = bronze::embed::globalValue("globalThis");
+        if (gt.found && bronze::embed::isObject(gt.value)) {
+            bronze::embed::HandleScope scope;
+            bronze::embed::Local<bronze::Value> gobj(scope, gt.value);
+            bronze::embed::Local<bronze::Value> jval(scope, luaToJs(rt, Value(val)));
+            (void)bronze::embed::setProperty(gobj.get(), name, jval.get());
+        }
+    };
+
     bridge.getProperty = [&rt](uint64_t obj, std::string_view key) -> uint64_t {
         bronze::embed::HandleScope scope;
         bronze::embed::Local<bronze::Value> js_obj(scope, unwrapBronzeHostObject(Value(obj)));

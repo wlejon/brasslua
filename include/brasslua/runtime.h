@@ -24,6 +24,7 @@ namespace brasslua {
 // global lookups and operations on host objects (bro.*, DOM, <sibling>_api).
 struct HostBridge {
     std::function<uint64_t(std::string_view name)> getGlobal;
+    std::function<void(std::string_view name, uint64_t val)> setGlobal;
     std::function<uint64_t(uint64_t obj, std::string_view key)> getProperty;
     std::function<void(uint64_t obj, std::string_view key, uint64_t val)> setProperty;
     std::function<uint64_t(uint64_t obj, uint64_t key)> getIndex;

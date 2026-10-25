@@ -51,7 +51,11 @@ uint64_t brasslua_rt_get_global(uint32_t intern_id) {
 }
 
 void brasslua_rt_set_global(uint32_t intern_id, uint64_t val) {
-    RuntimeState::current().setGlobalById(intern_id, Value(val));
+    auto& rt = RuntimeState::current();
+    rt.setGlobalById(intern_id, Value(val));
+    if (rt.hostBridge().setGlobal) {
+        rt.hostBridge().setGlobal(rt.getStringById(intern_id), val);
+    }
 }
 
 uint64_t brasslua_rt_string_from_id(uint32_t intern_id) {
