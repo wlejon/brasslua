@@ -75,6 +75,19 @@ if(NOT MSVC)
     target_compile_options(brasslua PRIVATE -O3)
 endif()
 
+# A Lua error is a C++ exception, and it is thrown through the runtime's
+# extern "C" entry points (brasslua_rt_call, the table and arithmetic slow
+# paths) on its way from `error` to the `pcall` that catches it. MSVC's default
+# /EHsc assumes an extern "C" function never throws, so it drops the handlers
+# around such calls and the error ends the process instead; /EHc- keeps them.
+# Every target that catches a Lua error compiles with it.
+function(brasslua_extern_c_may_throw target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /EHc-)
+    endif()
+endfunction()
+brasslua_extern_c_may_throw(brasslua)
+
 target_include_directories(brasslua PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -99,6 +112,7 @@ target_link_libraries(brasslua PUBLIC
 add_executable(brasslua_cli src/cli/main.cpp)
 set_target_properties(brasslua_cli PROPERTIES OUTPUT_NAME brasslua)
 target_link_libraries(brasslua_cli PRIVATE brasslua)
+brasslua_extern_c_may_throw(brasslua_cli)
 
 if(BRASSLUA_ENABLE_BRONZE AND TARGET bronze_runtime_shared)
     add_library(brasslua_bronze STATIC
@@ -108,6 +122,7 @@ if(BRASSLUA_ENABLE_BRONZE AND TARGET bronze_runtime_shared)
     if(NOT MSVC)
         target_compile_options(brasslua_bronze PRIVATE -O3)
     endif()
+    brasslua_extern_c_may_throw(brasslua_bronze)
     target_include_directories(brasslua_bronze PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -128,6 +143,7 @@ if(BRASSLUA_BUILD_TESTS)
         tests/test_luajit_oracle.cpp
     )
     target_link_libraries(brasslua_tests PRIVATE brasslua)
+    brasslua_extern_c_may_throw(brasslua_tests)
     add_test(NAME brasslua_unit_and_oracle_tests COMMAND brasslua_tests)
 
     if(TARGET brasslua_bronze)
@@ -135,6 +151,7 @@ if(BRASSLUA_BUILD_TESTS)
             tests/test_bronze_bridge.cpp
         )
         target_link_libraries(brasslua_bronze_tests PRIVATE brasslua_bronze)
+        brasslua_extern_c_may_throw(brasslua_bronze_tests)
         add_test(NAME brasslua_bronze_bridge_tests COMMAND brasslua_bronze_tests)
     endif()
 endif()

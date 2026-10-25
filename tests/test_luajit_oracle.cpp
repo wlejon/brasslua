@@ -1,10 +1,17 @@
 #include "brasslua/runtime.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#define popen _popen
+#define pclose _pclose
+#endif
 
 namespace brasslua::tests {
 
@@ -22,6 +29,18 @@ std::string runExternalCommand(const std::string& cmd) {
     return out;
 }
 
+// The oracle interpreters are found by name on PATH, so the suite runs
+// wherever lua5.4 and luajit are installed (on Windows, as lua5.4.exe and
+// luajit.exe). A missing one is reported and its cases skipped, not passed.
+bool oracleAvailable(const char* binary) {
+#if defined(_WIN32)
+    std::string probe = std::string("where ") + binary + " >NUL 2>NUL";
+#else
+    std::string probe = std::string("command -v ") + binary + " >/dev/null 2>&1";
+#endif
+    return std::system(probe.c_str()) == 0;
+}
+
 std::string runBrassLua(std::string_view code, bool& ok_out) {
     auto& rt = RuntimeState::current();
     rt.reset();
@@ -37,7 +56,8 @@ std::string runBrassLua(std::string_view code, bool& ok_out) {
 }
 
 bool checkOracle(const char* name, const char* binary_path, std::string_view lua_code) {
-    std::string tmp_file = "/tmp/brasslua_oracle_case.lua";
+    std::string tmp_file =
+        (std::filesystem::temp_directory_path() / "brasslua_oracle_case.lua").string();
     {
         std::ofstream ofs(tmp_file, std::ios::binary);
         ofs.write(lua_code.data(), static_cast<std::streamsize>(lua_code.size()));
@@ -70,7 +90,7 @@ int runLuaOracleTests() {
     const std::vector<OracleCase> cases = {
         {
             "lua54_integers_and_bitwise",
-            "/usr/bin/lua5.4",
+            "lua5.4",
             R"(
                 print(math.type(123), math.type(123.0))
                 print(math.maxinteger, math.mininteger)
@@ -83,7 +103,7 @@ int runLuaOracleTests() {
         },
         {
             "lua54_tables_and_metatables",
-            "/usr/bin/lua5.4",
+            "lua5.4",
             R"(
                 local Vec = {}
                 Vec.__index = Vec
@@ -104,7 +124,7 @@ int runLuaOracleTests() {
         },
         {
             "lua54_closures_and_upvalues",
-            "/usr/bin/lua5.4",
+            "lua5.4",
             R"(
                 local function make_counter(start, step)
                     local n = start
@@ -120,7 +140,7 @@ int runLuaOracleTests() {
         },
         {
             "lua54_coroutines_and_generators",
-            "/usr/bin/lua5.4",
+            "lua5.4",
             R"(
                 local function fib_gen(n)
                     return coroutine.wrap(function()
@@ -140,7 +160,7 @@ int runLuaOracleTests() {
         },
         {
             "luajit_sieve_and_algorithms",
-            "/usr/bin/luajit",
+            "luajit",
             R"(
                 local is_prime = {}
                 local N = 200
@@ -161,7 +181,7 @@ int runLuaOracleTests() {
         },
         {
             "luajit_bitops_and_strings",
-            "/usr/bin/luajit",
+            "luajit",
             R"(
                 local x = 0x12345678
                 for i = 1, 50 do
@@ -176,6 +196,10 @@ int runLuaOracleTests() {
     };
 
     for (const auto& tc : cases) {
+        if (!oracleAvailable(tc.oracle_bin)) {
+            std::cerr << "[SKIP] '" << tc.name << "': oracle " << tc.oracle_bin << " is not on PATH\n";
+            continue;
+        }
         if (!checkOracle(tc.name, tc.oracle_bin, tc.code)) {
             ++failures;
         }
