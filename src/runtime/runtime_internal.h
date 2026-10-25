@@ -75,6 +75,9 @@ void recomputeMetatableFlags(RuntimeState& rt, LuaTable* tbl);
 uint32_t getOrComputeMetatableFlags(RuntimeState& rt, LuaTable* mt);
 Value lookupMetamethod(RuntimeState& rt, Value obj, std::string_view event);
 void armTableFinalizerIfNeeded(RuntimeState& rt, LuaTable* tbl);
+// The raw length `#t` (a border, no __len): O(1) when array_len still names
+// one, else a binary search of the array part. Keeps array_len as the hint.
+int64_t rawTableLength(LuaTable* tbl) noexcept;
 
 bool tryCoerceToDouble(Value v, double& out) noexcept;
 bool tryCoerceToInt64(Value v, int64_t& out) noexcept;

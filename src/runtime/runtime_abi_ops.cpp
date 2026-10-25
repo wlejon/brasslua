@@ -350,9 +350,9 @@ uint64_t brasslua_rt_call_method(uint64_t obj, uint32_t method_intern_id, uint32
 uint64_t brasslua_rt_call_method_multiret(uint64_t obj, uint32_t method_intern_id, uint32_t slot_hint,
                                           const uint64_t* prefix_args, int64_t prefix_count) {
     auto& rt = RuntimeState::current();
-    std::vector<uint64_t> tail = rt.multiRetVec();
+    const size_t tail_count = rt.multiRetCount();
     size_t pcount = prefix_count > 0 ? static_cast<size_t>(prefix_count) : 0;
-    size_t total = pcount + tail.size();
+    size_t total = pcount + tail_count;
     uint64_t stack_buf[16];
     std::vector<uint64_t> heap_buf;
     uint64_t* full_args = stack_buf;
@@ -363,8 +363,8 @@ uint64_t brasslua_rt_call_method_multiret(uint64_t obj, uint32_t method_intern_i
     for (size_t i = 0; i < pcount; ++i) {
         full_args[i] = prefix_args[i];
     }
-    for (size_t i = 0; i < tail.size(); ++i) {
-        full_args[pcount + i] = tail[i];
+    for (size_t i = 0; i < tail_count; ++i) {
+        full_args[pcount + i] = rt.getMultiRet(i);
     }
     return brasslua_rt_call_method(obj, method_intern_id, slot_hint, full_args, static_cast<int64_t>(total));
 }
@@ -379,14 +379,16 @@ void brasslua_rt_clear_multiret(void) {
 
 uint64_t brasslua_rt_prepend_multiret(const uint64_t* prefix_vals, int64_t prefix_count) {
     auto& rt = RuntimeState::current();
-    std::vector<uint64_t> tail = rt.multiRetVec();
+    const size_t tail_count = rt.multiRetCount();
     size_t pcount = prefix_count > 0 ? static_cast<size_t>(prefix_count) : 0;
     std::vector<uint64_t> combined;
-    combined.reserve(pcount + tail.size());
+    combined.reserve(pcount + tail_count);
     for (size_t i = 0; i < pcount; ++i) {
         combined.push_back(prefix_vals[i]);
     }
-    combined.insert(combined.end(), tail.begin(), tail.end());
+    for (size_t i = 0; i < tail_count; ++i) {
+        combined.push_back(rt.getMultiRet(i));
+    }
     rt.setMultiRet(combined.data(), combined.size());
     return combined.empty() ? kNilBits : combined[0];
 }

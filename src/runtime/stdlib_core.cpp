@@ -390,12 +390,7 @@ uint64_t luaRawlen(void* /*cl*/, const uint64_t* args, int64_t nargs) {
         return Value::fromInt64(s ? static_cast<int64_t>(s->length) : 0).rawBits();
     }
     if (v.isTable()) {
-        auto* tbl = static_cast<const LuaTable*>(v.asPointer());
-        uint32_t len = 0;
-        while (len < tbl->array_cap && !Value(tbl->array_data[len]).isNil()) {
-            ++len;
-        }
-        return Value::fromInt64(static_cast<int64_t>(len)).rawBits();
+        return Value::fromInt64(rawTableLength(static_cast<LuaTable*>(v.asPointer()))).rawBits();
     }
     throw LuaRuntimeError("bad argument #1 to 'rawlen' (table or string expected)");
 }

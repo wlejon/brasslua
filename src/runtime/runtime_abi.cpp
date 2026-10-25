@@ -446,6 +446,50 @@ uint64_t returnMulti(RuntimeState& rt, const std::vector<uint64_t>& vals) {
     return vals.empty() ? kNilBits : vals[0];
 }
 
+int64_t rawTableLength(LuaTable* tbl) noexcept {
+    const uint64_t* arr = tbl->array_data;
+    const uint32_t cap = tbl->array_cap;
+    // array_len is a hint: setters keep it at the highest non-nil index they
+    // wrote, but compiled code stores into the array part without moving it.
+    const uint32_t hint = tbl->array_len < cap ? tbl->array_len : cap;
+    auto present = [&](uint32_t i) { return !Value(arr[i - 1]).isNil(); }; // 1-based
+    if (hint < cap || tbl->hash_cap == 0) {
+        if ((hint == 0 || present(hint)) && (hint == cap || !present(hint + 1))) {
+            return hint;
+        }
+        if (hint + 1 < cap && present(hint + 1) && !present(hint + 2)) {
+            tbl->array_len = hint + 1; // one append since the hint was set
+            return hint + 1;
+        }
+    }
+    uint32_t len;
+    if (cap == 0 || present(cap)) {
+        len = cap;
+    } else {
+        // A border in [lo, hi): lo is 0 or present, hi is absent.
+        uint32_t lo = 0, hi = cap;
+        if (hint > 0 && hint < cap) {
+            if (present(hint)) lo = hint;
+            else hi = hint;
+        }
+        while (hi - lo > 1) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            if (present(mid)) lo = mid;
+            else hi = mid;
+        }
+        len = lo;
+    }
+    tbl->array_len = len;
+    if (len < cap || tbl->hash_cap == 0) return len;
+    // The array part is full: the border may continue into the hash part.
+    int64_t n = len;
+    for (;;) {
+        const uint64_t key = Value::fromInt64(n + 1).rawBits();
+        if (Value(hashTableGet(tbl, key, hashLuaKey(key))).isNil()) return n;
+        ++n;
+    }
+}
+
 } // namespace brasslua
 
 using namespace brasslua;
@@ -696,12 +740,9 @@ int64_t brasslua_rt_table_len(uint64_t table) {
             return Value(res).asInt64();
         }
     }
-    uint32_t len = 0;
-    while (len < tbl->array_cap && !Value(tbl->array_data[len]).isNil()) {
-        ++len;
-    }
-    return static_cast<int64_t>(len);
+    return rawTableLength(tbl);
 }
+
 
 uint64_t brasslua_rt_next(uint64_t table, uint64_t key, uint64_t* out_val) {
     if (out_val) *out_val = kNilBits;
