@@ -1,5 +1,6 @@
 #include "brasslua/bronze_bridge.h"
 #include "runtime/runtime_internal.h"
+#include "abi/bronze_abi.h"
 
 #include <brass/gc/heap.hpp>
 
@@ -542,8 +543,16 @@ void attachBronzeBridge(RuntimeState& rt) {
     bridge.setProperty = [&rt](uint64_t obj, std::string_view key, uint64_t val) {
         bronze::embed::HandleScope scope;
         bronze::embed::Local<bronze::Value> js_obj(scope, unwrapBronzeHostObject(Value(obj)));
+        bronze::embed::Local<bronze::Value> js_key(scope, bronze::embed::fromUtf8(key));
         bronze::embed::Local<bronze::Value> js_val(scope, luaToJs(rt, Value(val)));
-        (void)bronze::embed::setProperty(js_obj.get(), key, js_val.get());
+        auto cr = bronze::embed::catchThrow([&]() -> bronze::Value {
+            bronze_elem_set(js_obj.get().rawBits(), js_key.get().rawBits(),
+                            js_val.get().rawBits(), /*strict=*/false);
+            return bronze::embed::undefined();
+        });
+        if (cr.thrown) {
+            throw LuaRuntimeError(extractJsErrorMessage(cr.value));
+        }
     };
 
     bridge.getIndex = [&rt](uint64_t obj, uint64_t key) -> uint64_t {
@@ -565,17 +574,16 @@ void attachBronzeBridge(RuntimeState& rt) {
     bridge.setIndex = [&rt](uint64_t obj, uint64_t key, uint64_t val) {
         bronze::embed::HandleScope scope;
         bronze::embed::Local<bronze::Value> js_obj(scope, unwrapBronzeHostObject(Value(obj)));
+        bronze::embed::Local<bronze::Value> js_key(scope, luaToJs(rt, Value(key)));
         bronze::embed::Local<bronze::Value> js_val(scope, luaToJs(rt, Value(val)));
-        Value kv(key);
-        if (kv.isInteger()) {
-            int64_t idx = kv.asInt64();
-            if (idx >= 0 && idx <= static_cast<int64_t>(UINT32_MAX)) {
-                (void)bronze::embed::setElement(js_obj.get(), static_cast<uint32_t>(idx), js_val.get());
-                return;
-            }
+        auto cr = bronze::embed::catchThrow([&]() -> bronze::Value {
+            bronze_elem_set(js_obj.get().rawBits(), js_key.get().rawBits(),
+                            js_val.get().rawBits(), /*strict=*/false);
+            return bronze::embed::undefined();
+        });
+        if (cr.thrown) {
+            throw LuaRuntimeError(extractJsErrorMessage(cr.value));
         }
-        std::string kstr = valueToStdString(rt, kv);
-        (void)bronze::embed::setProperty(js_obj.get(), kstr, js_val.get());
     };
 
     bridge.callHost = [&rt](uint64_t callee, uint64_t this_val,

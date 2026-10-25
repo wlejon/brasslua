@@ -41,15 +41,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Bound Ninja compile/link concurrency per AGENTS.md Section 5 (16 GB RAM envelope)
-set(BRO_COMPILE_JOBS "4" CACHE STRING "Max concurrent compile jobs")
-set(BRO_LINK_JOBS "2" CACHE STRING "Max concurrent link jobs")
-set_property(GLOBAL PROPERTY JOB_POOLS
-    compile_pool=${BRO_COMPILE_JOBS}
-    link_pool=${BRO_LINK_JOBS}
-)
-set(CMAKE_JOB_POOL_COMPILE compile_pool)
-set(CMAKE_JOB_POOL_LINK link_pool)
+if(BRASSLUA_IS_TOP_LEVEL)
+    # Bound Ninja compile/link concurrency per AGENTS.md Section 5 (16 GB RAM envelope)
+    set(BRO_COMPILE_JOBS "4" CACHE STRING "Max concurrent compile jobs")
+    set(BRO_LINK_JOBS "2" CACHE STRING "Max concurrent link jobs")
+    set_property(GLOBAL PROPERTY JOB_POOLS
+        compile_job_pool=${BRO_COMPILE_JOBS}
+        link_job_pool=${BRO_LINK_JOBS}
+    )
+    set(CMAKE_JOB_POOL_COMPILE compile_job_pool)
+    set(CMAKE_JOB_POOL_LINK link_job_pool)
+endif()
 
 find_package(Threads REQUIRED)
 
