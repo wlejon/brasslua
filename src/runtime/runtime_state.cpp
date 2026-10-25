@@ -1,5 +1,6 @@
 #include "runtime/runtime_internal.h"
 
+#include <brass/gc/fiber.hpp>
 #include <brass/gc/heap.hpp>
 #include <brass/gc/object.hpp>
 #include <brass/gc/tracer.hpp>
@@ -78,8 +79,9 @@ void traceLuaTable(uintptr_t payload, size_t /*payload_bytes*/, brass::gc::Trace
 
 void traceLuaClosure(uintptr_t payload, size_t /*payload_bytes*/, brass::gc::Tracer& t) {
     auto* cl = reinterpret_cast<LuaClosure*>(payload);
+    // `upvalues` points at the closure's own trailing array (allocClosure),
+    // not at an object of its own, so only the cells it holds are visited.
     if (!cl->upvalues) return;
-    t.visit_address(reinterpret_cast<uintptr_t*>(&cl->upvalues));
     for (uint32_t i = 0; i < cl->upvalue_count; ++i) {
         if (cl->upvalues[i]) {
             t.visit_address(reinterpret_cast<uintptr_t*>(&cl->upvalues[i]));
@@ -225,28 +227,49 @@ struct RuntimeState::Impl {
         // Conservative scan of active C/JIT stack frames so in-flight pinned
         // brasslua temporaries on the CPU stack or registers are kept alive across
         // any GC cycle without touching movable young objects on a shared heap.
+        // Every stack of the thread is scanned: the running one from here,
+        // and each coroutine's (a brass fiber) or the main stack while
+        // switched out, from where it switched away. The main stack's base is
+        // the anchor taken when the runtime was made.
         std::jmp_buf reg_buf;
         setjmp(reg_buf);
         volatile uintptr_t frame_var = 0;
-        uintptr_t sp = reinterpret_cast<uintptr_t>(&frame_var);
-        uintptr_t hi = stack_top_anchor;
-        if (hi > sp && (hi - sp) < (size_t{16} << 20)) {
-            const uint64_t raw_tag = active_heap->raw_address_tag();
-            for (uintptr_t p = sp & ~ uintptr_t{7}; p < hi; p += sizeof(uint64_t)) {
-                uint64_t word = *reinterpret_cast<const uint64_t*>(p);
-                if (active_heap->is_reference_tag(word)) {
-                    uintptr_t addr = static_cast<uintptr_t>(word & brass::gc::kAddressMask);
-                    if (!active_heap->is_young(addr)) {
-                        t.visit_conservative(&word);
-                    }
-                } else {
-                    uintptr_t addr = static_cast<uintptr_t>(word);
-                    if (active_heap->contains(addr) && !active_heap->is_young(addr)) {
-                        uintptr_t obj = active_heap->find_object(addr);
-                        if (obj != 0) {
-                            uint64_t tagged = (static_cast<uint64_t>(obj) & brass::gc::kAddressMask) | raw_tag;
-                            t.visit(&tagged);
-                        }
+        const uintptr_t sp = reinterpret_cast<uintptr_t>(&frame_var);
+        struct ScanCtx {
+            Impl* self;
+            brass::gc::Tracer* tracer;
+        } scan{this, &t};
+        brass::gc::Fiber::for_each_stack_span(sp, [](void* p, const brass::gc::Fiber::StackSpan& span) {
+            auto* c = static_cast<ScanCtx*>(p);
+            const uintptr_t hi = span.high != 0 ? span.high : c->self->stack_top_anchor;
+            if (hi > span.low && (hi - span.low) < (size_t{16} << 20)) {
+                c->self->scanWords(*c->tracer, span.low, hi);
+            }
+            if (span.regs != nullptr) {
+                c->self->scanWords(*c->tracer, reinterpret_cast<uintptr_t>(span.regs),
+                                   reinterpret_cast<uintptr_t>(span.regs_end));
+            }
+        }, &scan);
+    }
+
+    // Visits every word of [lo, hi) that may be a reference to an old object
+    // (young objects move, so a word that cannot be updated never names one).
+    void scanWords(brass::gc::Tracer& t, uintptr_t lo, uintptr_t hi) {
+        const uint64_t raw_tag = active_heap->raw_address_tag();
+        for (uintptr_t p = (lo + 7) & ~uintptr_t{7}; p + sizeof(uint64_t) <= hi; p += sizeof(uint64_t)) {
+            uint64_t word = *reinterpret_cast<const uint64_t*>(p);
+            if (active_heap->is_reference_tag(word)) {
+                uintptr_t addr = static_cast<uintptr_t>(word & brass::gc::kAddressMask);
+                if (!active_heap->is_young(addr)) {
+                    t.visit_conservative(&word);
+                }
+            } else {
+                uintptr_t addr = static_cast<uintptr_t>(word);
+                if (active_heap->contains(addr) && !active_heap->is_young(addr)) {
+                    uintptr_t obj = active_heap->find_object(addr);
+                    if (obj != 0) {
+                        uint64_t tagged = (static_cast<uint64_t>(obj) & brass::gc::kAddressMask) | raw_tag;
+                        t.visit(&tagged);
                     }
                 }
             }

@@ -1,5 +1,6 @@
 #include "runtime/runtime_internal.h"
 
+#include <brass/gc/fiber.hpp>
 #include <brass/gc/heap.hpp>
 #include <brass/gc/tracer.hpp>
 
@@ -7,34 +8,42 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
-
-#if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
-#include <ucontext.h>
-#define BRASSLUA_HAS_UCONTEXT 1
-#else
-#define BRASSLUA_HAS_UCONTEXT 0
-#endif
 
 namespace brasslua {
 
 namespace {
 
-#if BRASSLUA_HAS_UCONTEXT
+// A coroutine's state off the GC heap: the brass fiber it runs on (its own
+// machine stack, which brass's collector walks while it is suspended), the
+// values a resume or yield hands across, and how it ended. The coroutine
+// object (a GC object, which may move) is reached through `self`, traced, so
+// code on either side of a switch reads it fresh after the switch rather
+// than through a pointer taken before it.
 struct CoroutineContext {
-    static constexpr size_t kStackBytes = 256 * 1024;
-    ucontext_t coro_ctx{};
-    ucontext_t caller_ctx{};
-    std::vector<char> stack;
+    // A Lua call is a native frame here, so a coroutine's recursion depth is
+    // its stack's; reserved, not committed, until used.
+    static constexpr size_t kStackBytes = 1024 * 1024;
+    std::unique_ptr<brass::gc::Fiber> fiber;
+    Value self = Value::nil();
     std::vector<uint64_t> transfer_vals;
     std::string error_msg;
     Value error_val = Value::nil();
-    bool started = false;
+    bool error_occurred = false;
+    // Set by coroutine.close: the suspended yield the coroutine resumes in
+    // throws CoroutineUnwind instead of returning.
+    bool closing = false;
 
-    CoroutineContext() : stack(kStackBytes) {}
+    LuaCoroutine* coroutine() const noexcept { return static_cast<LuaCoroutine*>(self.asPointer()); }
 };
+
+// What coroutine.close throws at a suspended coroutine's yield to unwind its
+// frames. Not a Lua error and not a std::exception, so no pcall on the
+// coroutine's stack catches it; the coroutine's entry does.
+struct CoroutineUnwind {};
 
 void traceCoroutineContext(void* ctx_ptr, void* tracer_ptr) {
     auto* ctx = static_cast<CoroutineContext*>(ctx_ptr);
@@ -42,20 +51,20 @@ void traceCoroutineContext(void* ctx_ptr, void* tracer_ptr) {
     for (uint64_t& tv : ctx->transfer_vals) {
         t.visit(&tv);
     }
+    t.visit(reinterpret_cast<uint64_t*>(&ctx->self));
     t.visit(reinterpret_cast<uint64_t*>(&ctx->error_val));
 }
 
-void coroutineEntryTrampoline(uint32_t lo, uint32_t hi) {
-    uintptr_t ptr_val = (static_cast<uintptr_t>(hi) << 32) | static_cast<uintptr_t>(lo);
-    auto* co = reinterpret_cast<LuaCoroutine*>(ptr_val);
-    auto* ctx = static_cast<CoroutineContext*>(co->ctx_state);
+// The fiber's entry: the coroutine's body, with everything it can throw
+// caught here, its outermost frame.
+void coroutineEntry(void* arg) {
+    auto* ctx = static_cast<CoroutineContext*>(arg);
     auto& rt = RuntimeState::current();
-
     try {
         std::vector<uint64_t> init_args = std::move(ctx->transfer_vals);
         ctx->transfer_vals.clear();
         uint64_t r0 = brasslua_rt_call(
-            Value::fromFunction(co->entry_closure).rawBits(),
+            Value::fromFunction(ctx->coroutine()->entry_closure).rawBits(),
             init_args.data(),
             static_cast<int64_t>(init_args.size()));
         const auto& mret = rt.multiRetVec();
@@ -64,23 +73,67 @@ void coroutineEntryTrampoline(uint32_t lo, uint32_t hi) {
         } else {
             ctx->transfer_vals = {r0};
         }
-        co->status = CoroutineStatus::Dead;
+    } catch (const CoroutineUnwind&) {
+        ctx->transfer_vals.clear();
     } catch (const LuaRuntimeError& e) {
-        co->error_occurred = true;
-        co->status = CoroutineStatus::Dead;
+        ctx->error_occurred = true;
         ctx->error_msg = e.what();
         ctx->error_val = e.error_value;
     } catch (const std::exception& e) {
-        co->error_occurred = true;
-        co->status = CoroutineStatus::Dead;
+        ctx->error_occurred = true;
         ctx->error_msg = e.what();
+    } catch (...) {
+        ctx->error_occurred = true;
+        ctx->error_msg = "unknown error in coroutine";
     }
-
-    setContextExit:
-    (void)0;
-    swapcontext(&ctx->coro_ctx, &ctx->caller_ctx);
+    ctx->coroutine()->status = CoroutineStatus::Dead;
 }
-#endif
+
+CoroutineContext* contextOf(RuntimeState& rt, LuaCoroutine* co) {
+    if (!co->ctx_state) {
+        auto* ctx = new CoroutineContext();
+        co->ctx_state = ctx;
+        co->trace_ctx = &traceCoroutineContext;
+        rt.heap().add_finalizer(
+            reinterpret_cast<uintptr_t>(co),
+            [](void* p) { delete static_cast<CoroutineContext*>(p); },
+            ctx);
+    }
+    return static_cast<CoroutineContext*>(co->ctx_state);
+}
+
+// Runs `co` on its fiber until it yields, returns, errs or (closing) unwinds;
+// `vals` go across as the resume's arguments. Returns with the coroutine's
+// status and the running coroutine set back for the resumer.
+void runCoroutine(RuntimeState& rt, Value co_val, CoroutineContext* ctx, std::vector<uint64_t> vals) {
+    auto* co = static_cast<LuaCoroutine*>(co_val.asPointer());
+    ctx->self = co_val;
+    if (!ctx->fiber) {
+        ctx->fiber = brass::gc::Fiber::create(&coroutineEntry, ctx, CoroutineContext::kStackBytes);
+        if (!ctx->fiber) throw LuaRuntimeError("cannot create a coroutine stack");
+    }
+    ctx->transfer_vals = std::move(vals);
+
+    LuaCoroutine* prev = getRunningCoroutine(rt);
+    if (prev) prev->status = CoroutineStatus::Normal;
+    co->caller = prev;
+    co->status = CoroutineStatus::Running;
+    setRunningCoroutine(rt, co);
+
+    ctx->fiber->resume();
+
+    // Both objects may have moved while the coroutine ran: read them again
+    // through the traced references.
+    co = ctx->coroutine();
+    prev = co->caller;
+    co->caller = nullptr;
+    setRunningCoroutine(rt, prev);
+    if (prev) prev->status = CoroutineStatus::Running;
+    if (ctx->fiber->finished()) {
+        co->status = CoroutineStatus::Dead;
+        ctx->fiber.reset();
+    }
+}
 
 uint64_t luaPrint(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     auto& rt = RuntimeState::current();
@@ -578,44 +631,13 @@ uint64_t luaCoroResume(void* /*cl*/, const uint64_t* args, int64_t nargs) {
                                 rt.makeStringValue("cannot resume non-suspended coroutine")});
     }
 
-#if BRASSLUA_HAS_UCONTEXT
-    if (!co->ctx_state) {
-        auto* ctx = new CoroutineContext();
-        co->ctx_state = ctx;
-        co->trace_ctx = &traceCoroutineContext;
-        rt.heap().add_finalizer(
-            reinterpret_cast<uintptr_t>(co),
-            [](void* p) { delete static_cast<CoroutineContext*>(p); },
-            ctx);
-    }
-    auto* ctx = static_cast<CoroutineContext*>(co->ctx_state);
-    ctx->transfer_vals.assign(args + 1, args + nargs);
+    CoroutineContext* ctx = contextOf(rt, co);
+    runCoroutine(rt, Value(args[0]), ctx, std::vector<uint64_t>(args + 1, args + nargs));
 
-    if (!ctx->started) {
-        ctx->started = true;
-        getcontext(&ctx->coro_ctx);
-        ctx->coro_ctx.uc_stack.ss_sp = ctx->stack.data();
-        ctx->coro_ctx.uc_stack.ss_size = ctx->stack.size();
-        ctx->coro_ctx.uc_link = &ctx->caller_ctx;
-        uintptr_t ptr_val = reinterpret_cast<uintptr_t>(co);
-        uint32_t lo = static_cast<uint32_t>(ptr_val & 0xFFFFFFFFu);
-        uint32_t hi = static_cast<uint32_t>((ptr_val >> 32) & 0xFFFFFFFFu);
-        makecontext(&ctx->coro_ctx, reinterpret_cast<void (*)()>(&coroutineEntryTrampoline), 2, lo, hi);
-    }
-
-    LuaCoroutine* prev = getRunningCoroutine(rt);
-    if (prev) prev->status = CoroutineStatus::Normal;
-    co->caller = prev;
-    co->status = CoroutineStatus::Running;
-    setRunningCoroutine(rt, co);
-
-    swapcontext(&ctx->caller_ctx, &ctx->coro_ctx);
-
-    setRunningCoroutine(rt, prev);
-    if (prev) prev->status = CoroutineStatus::Running;
-
-    if (co->error_occurred) {
+    if (ctx->error_occurred) {
+        ctx->error_occurred = false;
         uint64_t err_bits = !ctx->error_val.isNil() ? ctx->error_val.rawBits() : rt.makeStringValue(ctx->error_msg);
+        ctx->error_val = Value::nil();
         return returnMulti(rt, {Value::fromBool(false).rawBits(), err_bits});
     }
     std::vector<uint64_t> ret;
@@ -624,30 +646,22 @@ uint64_t luaCoroResume(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     ret.insert(ret.end(), ctx->transfer_vals.begin(), ctx->transfer_vals.end());
     ctx->transfer_vals.clear();
     return returnMulti(rt, ret);
-#else
-    return returnMulti(rt, {Value::fromBool(false).rawBits(), rt.makeStringValue("coroutines unsupported")});
-#endif
 }
 
 uint64_t luaCoroYield(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     auto& rt = RuntimeState::current();
     LuaCoroutine* co = getRunningCoroutine(rt);
-    if (!co || !co->ctx_state) {
+    if (!co || !co->ctx_state || brass::gc::Fiber::current() == nullptr) {
         throw LuaRuntimeError("attempt to yield from outside a coroutine");
     }
-#if BRASSLUA_HAS_UCONTEXT
     auto* ctx = static_cast<CoroutineContext*>(co->ctx_state);
     ctx->transfer_vals.assign(args, args + nargs);
     co->status = CoroutineStatus::Suspended;
-    swapcontext(&ctx->coro_ctx, &ctx->caller_ctx);
+    brass::gc::Fiber::suspend();
+    if (ctx->closing) throw CoroutineUnwind{};
     std::vector<uint64_t> resumed = std::move(ctx->transfer_vals);
     ctx->transfer_vals.clear();
     return returnMulti(rt, resumed);
-#else
-    (void)args;
-    (void)nargs;
-    return kNilBits;
-#endif
 }
 
 uint64_t luaCoroWrapCaller(void* cl_ptr, const uint64_t* args, int64_t nargs) {
@@ -687,7 +701,28 @@ uint64_t luaCoroClose(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     if (co->status == CoroutineStatus::Running || co->status == CoroutineStatus::Normal) {
         throw LuaRuntimeError("cannot close a running or normal coroutine");
     }
+    // A coroutine suspended mid-body is resumed once more, to unwind: its
+    // yield throws CoroutineUnwind, which runs the C++ frames' destructors on
+    // the way out and ends at the entry; then its stack is freed.
+    auto* ctx = static_cast<CoroutineContext*>(co->ctx_state);
+    if (ctx && ctx->fiber && ctx->fiber->started() && co->status == CoroutineStatus::Suspended) {
+        ctx->closing = true;
+        runCoroutine(rt, Value(args[0]), ctx, {});
+        ctx->closing = false;
+        co = ctx->coroutine();
+    }
     co->status = CoroutineStatus::Dead;
+    if (ctx) {
+        ctx->fiber.reset();
+        ctx->transfer_vals.clear();
+        if (ctx->error_occurred) {
+            ctx->error_occurred = false;
+            uint64_t err_bits =
+                !ctx->error_val.isNil() ? ctx->error_val.rawBits() : rt.makeStringValue(ctx->error_msg);
+            ctx->error_val = Value::nil();
+            return returnMulti(rt, {Value::fromBool(false).rawBits(), err_bits});
+        }
+    }
     return Value::fromBool(true).rawBits();
 }
 

@@ -88,7 +88,7 @@ struct alignas(8) LuaCoroutine {
     LuaTable*       metatable      = nullptr; // Offset 24
     LuaClosure*     entry_closure  = nullptr; // Offset 32
     LuaCoroutine*   caller         = nullptr; // Offset 40
-    void*           ctx_state      = nullptr; // Offset 48: heap-allocated CoroutineContext (ucontext + stack)
+    void*           ctx_state      = nullptr; // Offset 48: heap-allocated CoroutineContext (its brass fiber)
     void (*trace_ctx)(void* ctx_state, void* tracer_ptr) = nullptr;
     CoroutineStatus status         = CoroutineStatus::Suspended;
     bool            error_occurred = false;
