@@ -1,4 +1,5 @@
 #include "runtime/runtime_internal.h"
+#include "runtime/stdlib_aux.h"
 
 #include <brass/gc/heap.hpp>
 
@@ -37,6 +38,64 @@ int compareIntFloat(int64_t i, double d) noexcept {
     if (i < id) return -1;
     if (i > id) return 1;
     return 0;
+}
+
+// An arithmetic operand: a number, or a string read as one (Lua's string
+// coercion keeps "10" an integer).
+bool arithOperand(Value v, Value& out) noexcept {
+    if (v.isNumeric()) {
+        out = v;
+        return true;
+    }
+    if (v.isString()) {
+        auto* s = static_cast<const LuaString*>(v.asPointer());
+        return s && stringToNumber(std::string_view(s->data, s->length), out);
+    }
+    return false;
+}
+
+double asDouble(Value v) noexcept {
+    return v.isInteger() ? static_cast<double>(v.asInt64()) : v.asDouble();
+}
+
+// a op b for the operators with an integer form: integers stay integers.
+template <typename IntOp, typename FloatOp>
+bool arith(uint64_t a, uint64_t b, IntOp int_op, FloatOp float_op, uint64_t& out) {
+    Value na, nb;
+    if (!arithOperand(Value(a), na) || !arithOperand(Value(b), nb)) return false;
+    if (na.isInteger() && nb.isInteger()) {
+        out = Value::fromInt64(int_op(na.asInt64(), nb.asInt64())).rawBits();
+    } else {
+        out = Value::fromDouble(float_op(asDouble(na), asDouble(nb))).rawBits();
+    }
+    return true;
+}
+
+// luaT_objtypename: a table's or userdata's __name, else its type's name.
+std::string objTypeName(RuntimeState& rt, Value v) {
+    if (v.isTable() || v.isFullUserdata()) {
+        Value name = lookupMetamethod(rt, v, "__name");
+        if (name.isString()) return std::string(valueToStringView(rt, name));
+    }
+    return typeNameOf(v);
+}
+
+// luaG_ordererror.
+[[noreturn]] void throwOrderError(RuntimeState& rt, Value a, Value b) {
+    const std::string t1 = objTypeName(rt, a);
+    const std::string t2 = objTypeName(rt, b);
+    if (t1 == t2) throw LuaRuntimeError("attempt to compare two " + t1 + " values");
+    throw LuaRuntimeError("attempt to compare " + t1 + " with " + t2);
+}
+
+int64_t wrapAdd(int64_t x, int64_t y) noexcept {
+    return static_cast<int64_t>(static_cast<uint64_t>(x) + static_cast<uint64_t>(y));
+}
+int64_t wrapSub(int64_t x, int64_t y) noexcept {
+    return static_cast<int64_t>(static_cast<uint64_t>(x) - static_cast<uint64_t>(y));
+}
+int64_t wrapMul(int64_t x, int64_t y) noexcept {
+    return static_cast<int64_t>(static_cast<uint64_t>(x) * static_cast<uint64_t>(y));
 }
 
 } // namespace
@@ -394,7 +453,7 @@ uint64_t brasslua_rt_get_multiret(int64_t idx) {
 
 int64_t brasslua_rt_idiv_i64(int64_t a, int64_t b) {
     if (b == 0) {
-        throw LuaRuntimeError("attempt to divide by zero");
+        throw LuaRuntimeError("attempt to perform 'n//0'");
     }
     if (a == std::numeric_limits<int64_t>::min() && b == -1) {
         return std::numeric_limits<int64_t>::min();
@@ -428,10 +487,8 @@ uint64_t brasslua_rt_add(uint64_t a, uint64_t b) {
                                            static_cast<uint64_t>(vb.asInt64()));
         return Value::fromInt64(res).rawBits();
     }
-    double da = 0.0, db = 0.0;
-    if (tryCoerceToDouble(va, da) && tryCoerceToDouble(vb, db)) {
-        return Value::fromDouble(da + db).rawBits();
-    }
+    uint64_t r = 0;
+    if (arith(a, b, wrapAdd, [](double x, double y) { return x + y; }, r)) return r;
     return callBinaryMetamethod(RuntimeState::current(), a, b, "__add", "add");
 }
 
@@ -442,10 +499,8 @@ uint64_t brasslua_rt_sub(uint64_t a, uint64_t b) {
                                            static_cast<uint64_t>(vb.asInt64()));
         return Value::fromInt64(res).rawBits();
     }
-    double da = 0.0, db = 0.0;
-    if (tryCoerceToDouble(va, da) && tryCoerceToDouble(vb, db)) {
-        return Value::fromDouble(da - db).rawBits();
-    }
+    uint64_t r = 0;
+    if (arith(a, b, wrapSub, [](double x, double y) { return x - y; }, r)) return r;
     return callBinaryMetamethod(RuntimeState::current(), a, b, "__sub", "subtract");
 }
 
@@ -456,10 +511,8 @@ uint64_t brasslua_rt_mul(uint64_t a, uint64_t b) {
                                            static_cast<uint64_t>(vb.asInt64()));
         return Value::fromInt64(res).rawBits();
     }
-    double da = 0.0, db = 0.0;
-    if (tryCoerceToDouble(va, da) && tryCoerceToDouble(vb, db)) {
-        return Value::fromDouble(da * db).rawBits();
-    }
+    uint64_t r = 0;
+    if (arith(a, b, wrapMul, [](double x, double y) { return x * y; }, r)) return r;
     return callBinaryMetamethod(RuntimeState::current(), a, b, "__mul", "multiply");
 }
 
@@ -476,10 +529,8 @@ uint64_t brasslua_rt_idiv(uint64_t a, uint64_t b) {
     if (va.isInteger() && vb.isInteger()) {
         return Value::fromInt64(brasslua_rt_idiv_i64(va.asInt64(), vb.asInt64())).rawBits();
     }
-    double da = 0.0, db = 0.0;
-    if (tryCoerceToDouble(va, da) && tryCoerceToDouble(vb, db)) {
-        return Value::fromDouble(std::floor(da / db)).rawBits();
-    }
+    uint64_t r = 0;
+    if (arith(a, b, brasslua_rt_idiv_i64, [](double x, double y) { return std::floor(x / y); }, r)) return r;
     return callBinaryMetamethod(RuntimeState::current(), a, b, "__idiv", "floor-divide");
 }
 
@@ -496,10 +547,8 @@ uint64_t brasslua_rt_mod(uint64_t a, uint64_t b) {
     if (va.isInteger() && vb.isInteger()) {
         return Value::fromInt64(brasslua_rt_mod_i64(va.asInt64(), vb.asInt64())).rawBits();
     }
-    double da = 0.0, db = 0.0;
-    if (tryCoerceToDouble(va, da) && tryCoerceToDouble(vb, db)) {
-        return Value::fromDouble(brasslua_rt_fmod(da, db)).rawBits();
-    }
+    uint64_t r = 0;
+    if (arith(a, b, brasslua_rt_mod_i64, brasslua_rt_fmod, r)) return r;
     return callBinaryMetamethod(RuntimeState::current(), a, b, "__mod", "modulo");
 }
 
@@ -521,9 +570,10 @@ uint64_t brasslua_rt_unm(uint64_t a) {
         int64_t neg = static_cast<int64_t>(0ULL - static_cast<uint64_t>(va.asInt64()));
         return Value::fromInt64(neg).rawBits();
     }
-    double da = 0.0;
-    if (tryCoerceToDouble(va, da)) {
-        return Value::fromDouble(-da).rawBits();
+    Value n;
+    if (arithOperand(va, n)) {
+        if (n.isInteger()) return brasslua_rt_unm(n.rawBits());
+        return Value::fromDouble(-n.asDouble()).rawBits();
     }
     auto& rt = RuntimeState::current();
     Value mm = lookupMetamethod(rt, va, "__unm");
@@ -616,7 +666,10 @@ int32_t brasslua_rt_eq(uint64_t a, uint64_t b) {
         auto* sa = static_cast<const LuaString*>(va.asPointer());
         auto* sb = static_cast<const LuaString*>(vb.asPointer());
         if (sa == sb) return 1;
-        if (!sa || !sb || sa->length != sb->length || sa->hash != sb->hash) return 0;
+        if (!sa || !sb || sa->length != sb->length) return 0;
+        // Short strings are interned: two of them are equal only as one.
+        if (sa->length <= kShortStringMax) return 0;
+        if (sa->intern_id != kNotInterned && sb->intern_id != kNotInterned) return 0;
         return std::memcmp(sa->data, sb->data, sa->length) == 0 ? 1 : 0;
     }
     if ((va.isTable() && vb.isTable()) || (va.isFullUserdata() && vb.isFullUserdata())) {
@@ -663,7 +716,7 @@ int32_t brasslua_rt_lt(uint64_t a, uint64_t b) {
         uint64_t res = brasslua_rt_call_2(mm.rawBits(), a, b);
         return Value(res).isTruthy() ? 1 : 0;
     }
-    throw LuaRuntimeError("attempt to compare incompatible values");
+    throwOrderError(rt, va, vb);
 }
 
 int32_t brasslua_rt_le(uint64_t a, uint64_t b) {
@@ -696,13 +749,7 @@ int32_t brasslua_rt_le(uint64_t a, uint64_t b) {
         uint64_t res = brasslua_rt_call_2(mm.rawBits(), a, b);
         return Value(res).isTruthy() ? 1 : 0;
     }
-    mm = lookupMetamethod(rt, vb, "__lt");
-    if (mm.isNil()) mm = lookupMetamethod(rt, va, "__lt");
-    if (!mm.isNil()) {
-        uint64_t res = brasslua_rt_call_2(mm.rawBits(), b, a);
-        return Value(res).isTruthy() ? 0 : 1;
-    }
-    throw LuaRuntimeError("attempt to compare incompatible values");
+    throwOrderError(rt, va, vb);
 }
 
 double brasslua_rt_to_number(uint64_t v) {

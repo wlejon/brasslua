@@ -131,7 +131,9 @@ uint64_t rawTableGet(RuntimeState& rt, LuaTable* tbl, uint64_t key_bits) {
     if (k.isNil()) return kNilBits;
 
     if (k.isString()) {
-        return hashTableGet(tbl, key_bits, static_cast<const LuaString*>(k.asPointer())->hash);
+        key_bits = rt.internKey(key_bits, false);
+        if (key_bits == kNilBits) return kNilBits;
+        return hashTableGet(tbl, key_bits, static_cast<const LuaString*>(Value(key_bits).asPointer())->hash);
     }
 
     int64_t idx = 0;
@@ -158,7 +160,8 @@ void rawTableSet(RuntimeState& rt, LuaTable* tbl, uint64_t key_bits, uint64_t va
         // Any string store may change a metamethod of a table used as a
         // metatable; compiled code never stores a "__" field inline.
         tbl->cached_mt_flags = 0;
-        hashTableSet(rt, tbl, key_bits, val_bits, static_cast<const LuaString*>(k.asPointer())->hash);
+        key_bits = rt.internKey(key_bits, true);
+        hashTableSet(rt, tbl, key_bits, val_bits, static_cast<const LuaString*>(Value(key_bits).asPointer())->hash);
         return;
     }
 
@@ -303,14 +306,9 @@ bool tryCoerceToDouble(Value v, double& out) noexcept {
     }
     if (v.isString()) {
         auto* s = static_cast<const LuaString*>(v.asPointer());
-        if (!s || s->length == 0) return false;
-        char* end = nullptr;
-        double d = std::strtod(s->data, &end);
-        while (end && *end != '\0' && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
-            ++end;
-        }
-        if (end == s->data + s->length) {
-            out = d;
+        Value n;
+        if (s && stringToNumber(std::string_view(s->data, s->length), n)) {
+            out = n.isInteger() ? static_cast<double>(n.asInt64()) : n.asDouble();
             return true;
         }
     }
@@ -327,19 +325,13 @@ bool tryCoerceToInt64(Value v, int64_t& out) noexcept {
     }
     if (v.isString()) {
         auto* s = static_cast<const LuaString*>(v.asPointer());
-        if (!s || s->length == 0) return false;
-        char* end = nullptr;
-        long long iv = std::strtoll(s->data, &end, 0);
-        while (end && *end != '\0' && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
-            ++end;
-        }
-        if (end == s->data + s->length) {
-            out = static_cast<int64_t>(iv);
-            return true;
-        }
-        double d = 0.0;
-        if (tryCoerceToDouble(v, d)) {
-            return tryConvertFloatToExactInt64(d, out);
+        Value n;
+        if (s && stringToNumber(std::string_view(s->data, s->length), n)) {
+            if (n.isInteger()) {
+                out = n.asInt64();
+                return true;
+            }
+            return tryConvertFloatToExactInt64(n.asDouble(), out);
         }
     }
     return false;
@@ -353,6 +345,23 @@ std::string_view valueToStringView(RuntimeState& /*rt*/, Value v) {
     return {};
 }
 
+size_t numberToChars(Value v, char* buf) noexcept {
+    if (v.isInteger()) {
+        return static_cast<size_t>(std::snprintf(buf, kNumberBufSize, "%lld", static_cast<long long>(v.asInt64())));
+    }
+    // Lua 5.4's lua_Number format: "%.14g", and ".0" after one that reads as an integer.
+    double d = v.asDouble();
+    if (std::isnan(d)) return static_cast<size_t>(std::snprintf(buf, kNumberBufSize, "%s", std::signbit(d) ? "-nan" : "nan"));
+    if (std::isinf(d)) return static_cast<size_t>(std::snprintf(buf, kNumberBufSize, "%s", d > 0 ? "inf" : "-inf"));
+    size_t n = static_cast<size_t>(std::snprintf(buf, kNumberBufSize, "%.14g", d));
+    if (std::strspn(buf, "-0123456789") == n) {
+        buf[n++] = '.';
+        buf[n++] = '0';
+        buf[n] = '\0';
+    }
+    return n;
+}
+
 std::string valueToStdString(RuntimeState& rt, Value v) {
     if (v.isString()) {
         auto* s = static_cast<const LuaString*>(v.asPointer());
@@ -360,19 +369,9 @@ std::string valueToStdString(RuntimeState& rt, Value v) {
     }
     if (v.isNil()) return "nil";
     if (v.isBool()) return v.asBool() ? "true" : "false";
-    if (v.isInteger()) {
-        return std::to_string(v.asInt64());
-    }
-    if (v.isFloat()) {
-        // Lua 5.4's lua_Number format: "%.14g", and ".0" after one that reads as an integer.
-        double d = v.asDouble();
-        if (std::isnan(d)) return std::signbit(d) ? "-nan" : "nan";
-        if (std::isinf(d)) return d > 0 ? "inf" : "-inf";
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.14g", d);
-        std::string s(buf);
-        if (s.find_first_of(".eE") == std::string::npos) s += ".0";
-        return s;
+    if (v.isNumeric()) {
+        char buf[kNumberBufSize];
+        return std::string(buf, numberToChars(v, buf));
     }
     if (v.isTable() || v.isFullUserdata()) {
         Value mm = lookupMetamethod(rt, v, "__tostring");
@@ -741,7 +740,8 @@ uint64_t brasslua_rt_next(uint64_t table, uint64_t key, uint64_t* out_val) {
     }
 
     if (tbl->hash_cap > 0) {
-        uint64_t norm_k = normalizeKey(rt, key);
+        uint64_t norm_k = kv.isString() ? rt.internKey(key, false) : normalizeKey(rt, key);
+        if (norm_k == kNilBits) return kNilBits;
         const uint32_t mask = tbl->hash_cap - 1;
         uint32_t h = hashLuaKey(norm_k) & mask;
         const bool is_boxed_i64 = Value(norm_k).isBoxedInt64();

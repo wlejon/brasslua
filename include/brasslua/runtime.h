@@ -52,6 +52,14 @@ public:
     std::string_view getStringById(uint32_t id) const;
     LuaString* getLuaStringById(uint32_t id);
     uint64_t makeStringValue(std::string_view str);
+    // The interned string equal to a string value: the value itself when it
+    // is interned; else the interned string of its bytes, which `insert`
+    // makes the value itself when there is none (so a key stored once is
+    // found by every equal string after it). Nil bits when there is none and
+    // `insert` is false: no table holds such a key.
+    uint64_t internKey(uint64_t str_bits, bool insert);
+    // A new string of these bytes, not interned (internString interns one).
+    LuaString* allocString(std::string_view str);
 
     // Globals (_ENV)
     void setGlobal(std::string_view name, Value val);
@@ -104,6 +112,21 @@ public:
     // Command-line args (`arg` table in Lua)
     void setScriptArgs(const std::string& script_path, const std::vector<std::string>& args);
 
+    // Values a native function keeps in a vector of its own (off the stack,
+    // where the conservative scan does not look) while it allocates: each
+    // collection visits them while the guard lives. Guards nest.
+    class RootedValues {
+    public:
+        explicit RootedValues(RuntimeState& rt);
+        ~RootedValues();
+        RootedValues(const RootedValues&) = delete;
+        RootedValues& operator=(const RootedValues&) = delete;
+        std::vector<uint64_t> values;
+
+    private:
+        RuntimeState& rt_;
+    };
+
     struct Impl;
     Impl* impl() noexcept { return impl_; }
     const Impl* impl() const noexcept { return impl_; }
@@ -111,6 +134,9 @@ public:
 private:
     RuntimeState();
     ~RuntimeState();
+
+    // Enters a string not yet interned into the intern table.
+    uint32_t adoptInterned(LuaString* lstr, uint32_t hash);
 
     Impl* impl_;
     std::vector<uint64_t> multiret_;

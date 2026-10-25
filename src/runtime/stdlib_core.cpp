@@ -1,4 +1,5 @@
 #include "runtime/runtime_internal.h"
+#include "runtime/stdlib_aux.h"
 
 #include <brass/gc/fiber.hpp>
 #include <brass/gc/heap.hpp>
@@ -185,57 +186,25 @@ uint64_t luaToString(void* /*cl*/, const uint64_t* args, int64_t nargs) {
 }
 
 uint64_t luaToNumber(void* /*cl*/, const uint64_t* args, int64_t nargs) {
-    if (nargs < 1) return kNilBits;
-    Value v(args[0]);
-    int64_t base = (nargs >= 2 && !Value(args[1]).isNil()) ? Value(args[1]).asInt64() : 10;
-    if (nargs < 2 || Value(args[1]).isNil()) {
+    Args a(args, nargs, "tonumber");
+    if (a.isNoneOrNil(2)) {
+        Value v = a.at(1);
         if (v.isNumeric()) return v.rawBits();
         if (v.isString()) {
             auto* s = static_cast<const LuaString*>(v.asPointer());
-            if (!s || s->length == 0) return kNilBits;
-            // Try integer first (Lua 5.4 tonumber returns integer when string has no dot/exponent)
-            std::string_view sv(s->data, s->length);
-            bool has_float_chars = false;
-            bool is_hex = false;
-            size_t p = 0;
-            while (p < sv.size() && std::isspace(static_cast<unsigned char>(sv[p]))) ++p;
-            if (p < sv.size() && (sv[p] == '+' || sv[p] == '-')) ++p;
-            if (p + 1 < sv.size() && sv[p] == '0' && (sv[p + 1] == 'x' || sv[p + 1] == 'X')) {
-                is_hex = true;
-            }
-            for (size_t i = p; i < sv.size(); ++i) {
-                char c = sv[i];
-                if (c == '.' || (!is_hex && (c == 'e' || c == 'E')) || (is_hex && (c == 'p' || c == 'P'))) {
-                    has_float_chars = true;
-                    break;
-                }
-            }
-            if (!has_float_chars) {
-                char* end = nullptr;
-                long long iv = std::strtoll(s->data, &end, 0);
-                while (end && *end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
-                if (end == s->data + s->length) {
-                    return Value::fromInt64(static_cast<int64_t>(iv)).rawBits();
-                }
-            }
-            double d = 0.0;
-            if (tryCoerceToDouble(v, d)) {
-                return Value::fromDouble(d).rawBits();
-            }
+            Value n;
+            if (stringToNumber(std::string_view(s->data, s->length), n)) return n.rawBits();
         }
+        a.checkAny(1);
         return kNilBits;
     }
-    if (!v.isString()) return kNilBits;
-    if (base < 2 || base > 36) {
-        throw LuaRuntimeError("bad argument #2 to 'tonumber' (base out of range)");
-    }
-    auto* s = static_cast<const LuaString*>(v.asPointer());
-    if (!s || s->length == 0) return kNilBits;
-    char* end = nullptr;
-    long long val = std::strtoll(s->data, &end, static_cast<int>(base));
-    while (end && *end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
-    if (end == s->data + s->length) {
-        return Value::fromInt64(static_cast<int64_t>(val)).rawBits();
+    int64_t base = a.checkInteger(2);
+    if (!a.at(1).isString()) a.typeError(1, "string");
+    if (base < 2 || base > 36) a.error(2, "base out of range");
+    auto* s = static_cast<const LuaString*>(a.at(1).asPointer());
+    int64_t n = 0;
+    if (stringToIntegerInBase(std::string_view(s->data, s->length), static_cast<int>(base), n)) {
+        return Value::fromInt64(n).rawBits();
     }
     return kNilBits;
 }
@@ -341,22 +310,6 @@ uint64_t luaSelect(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     return returnMulti(rt, ret);
 }
 
-uint64_t luaUnpack(void* /*cl*/, const uint64_t* args, int64_t nargs) {
-    auto& rt = RuntimeState::current();
-    if (nargs < 1 || !Value(args[0]).isTable()) return kNilBits;
-    uint64_t tbl_bits = args[0];
-    int64_t i = (nargs >= 2 && !Value(args[1]).isNil()) ? Value(args[1]).asInt64() : 1;
-    int64_t j = (nargs >= 3 && !Value(args[2]).isNil()) ? Value(args[2]).asInt64() : brasslua_rt_table_len(tbl_bits);
-    std::vector<uint64_t> ret;
-    if (j >= i) {
-        ret.reserve(static_cast<size_t>(j - i + 1));
-        for (int64_t k = i; k <= j; ++k) {
-            ret.push_back(brasslua_rt_table_get_int(tbl_bits, k));
-        }
-    }
-    return returnMulti(rt, ret);
-}
-
 uint64_t luaRawget(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     if (nargs < 2) return kNilBits;
     return brasslua_rt_rawget(args[0], args[1]);
@@ -377,6 +330,10 @@ uint64_t luaRawequal(void* /*cl*/, const uint64_t* args, int64_t nargs) {
         if (a.isFloat() && b.isFloat()) {
             return Value::fromBool(a.asDouble() == b.asDouble()).rawBits();
         }
+        return Value::fromBool(brasslua_rt_eq(args[0], args[1]) != 0).rawBits();
+    }
+    if (a.isString() && b.isString()) {
+        // No metamethod applies to strings: equality is their bytes.
         return Value::fromBool(brasslua_rt_eq(args[0], args[1]) != 0).rawBits();
     }
     return Value::fromBool(a == b).rawBits();
@@ -771,7 +728,6 @@ void registerCoreStdlib(RuntimeState& rt) {
     rt.setGlobal("pcall", makeNativeClosure(rt, &luaPcall, 1));
     rt.setGlobal("xpcall", makeNativeClosure(rt, &luaXpcall, 2));
     rt.setGlobal("select", makeNativeClosure(rt, &luaSelect, 1));
-    rt.setGlobal("unpack", makeNativeClosure(rt, &luaUnpack, 1));
     rt.setGlobal("rawget", makeNativeClosure(rt, &luaRawget, 2));
     rt.setGlobal("rawset", makeNativeClosure(rt, &luaRawset, 3));
     rt.setGlobal("rawequal", makeNativeClosure(rt, &luaRawequal, 2));

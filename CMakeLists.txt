@@ -65,7 +65,12 @@ add_library(brasslua STATIC
     src/runtime/runtime_abi_ops.cpp
     src/runtime/stdlib_core.cpp
     src/runtime/stdlib_math_bit.cpp
-    src/runtime/stdlib_string_table.cpp
+    src/runtime/lua_number.cpp
+    src/runtime/lua_pattern.cpp
+    src/runtime/stdlib_aux.cpp
+    src/runtime/stdlib_string.cpp
+    src/runtime/stdlib_string_pack.cpp
+    src/runtime/stdlib_table_io.cpp
     src/codegen/mir_lowering.cpp
     src/codegen/mir_lowering_table.cpp
     src/codegen/mir_lowering_expr.cpp
@@ -145,6 +150,7 @@ if(BRASSLUA_BUILD_TESTS)
         tests/test_luajit_oracle.cpp
     )
     target_link_libraries(brasslua_tests PRIVATE brasslua)
+    target_compile_definitions(brasslua_tests PRIVATE BRASSLUA_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
     brasslua_extern_c_may_throw(brasslua_tests)
     add_test(NAME brasslua_unit_and_oracle_tests COMMAND brasslua_tests)
 

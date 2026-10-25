@@ -81,9 +81,21 @@ uint32_t tableHashCapFor(uint32_t entries) noexcept;
 // one, else a binary search of the array part. Keeps array_len as the hint.
 int64_t rawTableLength(LuaTable* tbl) noexcept;
 
+// A string's number as Lua reads one (luaO_str2num): a decimal integer that
+// fits or a hex one (wrapping) is an integer, else strtod's reading of the
+// whole string (no 'inf' or 'nan'), spaces allowed about it. lua_number.cpp.
+bool stringToNumber(std::string_view s, Value& out) noexcept;
+// tonumber(s, base)'s reading: an optional '-', then base-`base` digits.
+bool stringToIntegerInBase(std::string_view s, int base, int64_t& out) noexcept;
 bool tryCoerceToDouble(Value v, double& out) noexcept;
 bool tryCoerceToInt64(Value v, int64_t& out) noexcept;
 bool tryConvertFloatToExactInt64(double d, int64_t& out) noexcept;
+// A number's string form as Lua writes it (tostring, .., a number passed as
+// a string): "%d" for an integer, "%.14g" for a float with ".0" after one
+// that reads as an integer. `buf` holds kNumberBufSize bytes; returns the
+// length written (NUL-terminated).
+inline constexpr size_t kNumberBufSize = 64;
+size_t numberToChars(Value v, char* buf) noexcept;
 std::string valueToStdString(RuntimeState& rt, Value v);
 std::string_view valueToStringView(RuntimeState& rt, Value v);
 
@@ -96,6 +108,8 @@ uint64_t returnMulti(RuntimeState& rt, const std::vector<uint64_t>& vals);
 // Stdlib registration entry points
 void registerCoreStdlib(RuntimeState& rt);
 void registerMathAndBitStdlib(RuntimeState& rt);
-void registerStringAndTableStdlib(RuntimeState& rt);
+void registerStringStdlib(RuntimeState& rt);
+void registerTableStdlib(RuntimeState& rt);
+void registerIoStdlib(RuntimeState& rt);
 
 } // namespace brasslua

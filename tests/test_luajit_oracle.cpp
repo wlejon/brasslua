@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -324,6 +325,22 @@ int runLuaOracleTests() {
         }
         if (!checkOracle(tc.name, tc.oracle_bin, tc.code)) {
             ++failures;
+        }
+    }
+
+    // Every tests/lua/*.lua is a case against lua5.4: the library
+    // conformance scripts, too long to keep inline.
+    const std::filesystem::path case_dir = std::filesystem::path(BRASSLUA_TEST_DIR) / "lua";
+    if (!oracleAvailable("lua5.4")) {
+        std::cerr << "[SKIP] " << case_dir.string() << ": oracle lua5.4 is not on PATH\n";
+    } else {
+        for (const auto& entry : std::filesystem::directory_iterator(case_dir)) {
+            if (entry.path().extension() != ".lua") continue;
+            std::ifstream ifs(entry.path(), std::ios::binary);
+            std::string code((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            if (!checkOracle(entry.path().filename().string().c_str(), "lua5.4", code)) {
+                ++failures;
+            }
         }
     }
 

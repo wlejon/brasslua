@@ -14,6 +14,16 @@ struct alignas(8) LuaString {
     char data[]; // NUL-terminated 8-bit clean bytes (may contain embedded NULs)
 };
 
+// Strings of up to kShortStringMax bytes are always interned, so two of them
+// are equal only when they are one object. A longer string made at run time
+// is an ordinary collectable object (intern_id kNotInterned, hash not yet
+// computed) compared by its bytes; it is interned only when it becomes a
+// table key (RuntimeState::internKey), which is what keeps table keys
+// comparable by their bits. String constants are interned whatever their
+// length.
+inline constexpr uint32_t kShortStringMax = 40;
+inline constexpr uint32_t kNotInterned = 0xFFFFFFFFu;
+
 inline constexpr uint64_t kTombstoneBits = kNilBits | 1ULL;
 
 struct alignas(8) LuaHashEntry {

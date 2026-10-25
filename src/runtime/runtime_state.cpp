@@ -200,11 +200,61 @@ brass::gc::HeapConfig makeBrassLuaHeapConfig() {
 
 } // namespace
 
-struct TransparentStringHash {
-    using is_transparent = void;
-    size_t operator()(std::string_view sv) const noexcept {
-        return std::hash<std::string_view>{}(sv);
+// The intern table: open addressing over (hash, id) pairs, so a probe reads
+// one array and touches a string's bytes only when the hashes agree.
+class InternTable {
+public:
+    // The id of the interned string of these bytes, or kNotInterned.
+    uint32_t find(std::string_view bytes, uint32_t hash, const std::vector<LuaString*>& strings) const noexcept {
+        if (slots_.empty()) return kNotInterned;
+        const size_t mask = slots_.size() - 1;
+        for (size_t i = hash & mask;; i = (i + 1) & mask) {
+            const Slot& s = slots_[i];
+            if (s.id == kNotInterned) return kNotInterned;
+            if (s.hash == hash) {
+                const LuaString* str = strings[s.id];
+                if (str->length == bytes.size() && std::memcmp(str->data, bytes.data(), bytes.size()) == 0) {
+                    return s.id;
+                }
+            }
+        }
     }
+
+    // Adds an id not in the table.
+    void insert(uint32_t hash, uint32_t id) {
+        if ((count_ + 1) * 2 > slots_.size()) grow();
+        place(hash, id);
+        ++count_;
+    }
+
+    void clear() noexcept {
+        slots_.clear();
+        count_ = 0;
+    }
+
+private:
+    struct Slot {
+        uint32_t hash = 0;
+        uint32_t id = kNotInterned;
+    };
+
+    void place(uint32_t hash, uint32_t id) noexcept {
+        const size_t mask = slots_.size() - 1;
+        size_t i = hash & mask;
+        while (slots_[i].id != kNotInterned) i = (i + 1) & mask;
+        slots_[i] = Slot{hash, id};
+    }
+
+    void grow() {
+        std::vector<Slot> old = std::move(slots_);
+        slots_.assign(old.empty() ? 1024 : old.size() * 2, Slot{});
+        for (const Slot& s : old) {
+            if (s.id != kNotInterned) place(s.hash, s.id);
+        }
+    }
+
+    std::vector<Slot> slots_;
+    size_t count_ = 0;
 };
 
 struct RuntimeState::Impl {
@@ -213,9 +263,12 @@ struct RuntimeState::Impl {
     brass::gc::Heap::RootSourceId root_source_id = 0;
     uintptr_t stack_top_anchor = 0;
 
-    std::unordered_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> str_to_id;
+    // Interned strings live as long as the runtime: id_to_lstr roots them
+    // and they never move.
+    InternTable str_to_id;
     std::vector<LuaString*> id_to_lstr;
 
+    std::vector<RuntimeState::RootedValues*> rooted_values;
     std::vector<Value> globals_by_id;
     LuaTable* env_table = nullptr;
     LuaTable* string_metatable = nullptr;
@@ -239,6 +292,9 @@ struct RuntimeState::Impl {
         }
         for (Value& v : globals_by_id) {
             t.visit(reinterpret_cast<uint64_t*>(&v));
+        }
+        for (RuntimeState::RootedValues* r : rooted_values) {
+            for (uint64_t& v : r->values) t.visit(&v);
         }
         if (rt.multiret_mode_ == 1) {
             t.visit(&rt.single_ret_);
@@ -423,33 +479,73 @@ void RuntimeState::reset() {
 void RuntimeState::registerStdlib() {
     registerCoreStdlib(*this);
     registerMathAndBitStdlib(*this);
-    registerStringAndTableStdlib(*this);
+    registerStringStdlib(*this);
+    registerTableStdlib(*this);
+    registerIoStdlib(*this);
 }
 
 uint32_t RuntimeState::internString(std::string_view str) {
-    auto it = impl_->str_to_id.find(str);
-    if (it != impl_->str_to_id.end()) {
-        return it->second;
-    }
-    uint32_t id = static_cast<uint32_t>(impl_->id_to_lstr.size());
+    const uint32_t hash = fnv1aHash(str);
+    const uint32_t id = impl_->str_to_id.find(str, hash, impl_->id_to_lstr);
+    if (id != kNotInterned) return id;
+    return adoptInterned(allocString(str), hash);
+}
+
+LuaString* RuntimeState::allocString(std::string_view str) {
     size_t alloc_bytes = sizeof(LuaString) + str.size() + 1;
     uintptr_t mem = impl_->active_heap->allocate(
-        alloc_bytes, getLayouts().leaf, brass::gc::kAllocPinned, kHostKindString);
+        alloc_bytes, getLayouts().leaf, brass::gc::kAllocPinned | brass::gc::kAllocUninitialized,
+        kHostKindString);
     auto* lstr = reinterpret_cast<LuaString*>(mem);
-    lstr->hash = fnv1aHash(str);
+    lstr->hash = 0;
     lstr->length = static_cast<uint32_t>(str.size());
-    lstr->intern_id = id;
+    lstr->intern_id = kNotInterned;
+    lstr->reserved = 0;
     if (!str.empty()) {
         std::memcpy(lstr->data, str.data(), str.size());
     }
     lstr->data[str.size()] = '\0';
+    return lstr;
+}
 
+uint32_t RuntimeState::adoptInterned(LuaString* lstr, uint32_t hash) {
+    uint32_t id = static_cast<uint32_t>(impl_->id_to_lstr.size());
+    lstr->hash = hash;
+    lstr->intern_id = id;
     impl_->id_to_lstr.push_back(lstr);
-    impl_->str_to_id.emplace(std::string(str), id);
+    impl_->str_to_id.insert(hash, id);
     if (impl_->globals_by_id.size() <= id) {
         impl_->globals_by_id.resize(id + 1, Value::nil());
     }
     return id;
+}
+
+uint64_t RuntimeState::internKey(uint64_t str_bits, bool insert) {
+    auto* lstr = static_cast<LuaString*>(Value(str_bits).asPointer());
+    if (lstr->intern_id != kNotInterned) return str_bits;
+    std::string_view bytes(lstr->data, lstr->length);
+    const uint32_t hash = fnv1aHash(bytes);
+    const uint32_t id = impl_->str_to_id.find(bytes, hash, impl_->id_to_lstr);
+    if (id != kNotInterned) {
+        return Value::fromString(impl_->id_to_lstr[id]).rawBits();
+    }
+    if (!insert) return kNilBits;
+    adoptInterned(lstr, hash);
+    return str_bits;
+}
+
+RuntimeState::RootedValues::RootedValues(RuntimeState& rt) : rt_(rt) {
+    rt_.impl_->rooted_values.push_back(this);
+}
+
+RuntimeState::RootedValues::~RootedValues() {
+    auto& list = rt_.impl_->rooted_values;
+    // Guards nest, so this one is last unless a guard outlives its scope.
+    if (!list.empty() && list.back() == this) {
+        list.pop_back();
+    } else {
+        list.erase(std::find(list.begin(), list.end(), this));
+    }
 }
 
 std::string_view RuntimeState::getStringById(uint32_t id) const {
@@ -464,6 +560,9 @@ LuaString* RuntimeState::getLuaStringById(uint32_t id) {
 }
 
 uint64_t RuntimeState::makeStringValue(std::string_view str) {
+    if (str.size() > kShortStringMax) {
+        return Value::fromString(allocString(str)).rawBits();
+    }
     uint32_t id = internString(str);
     return Value::fromString(impl_->id_to_lstr[id]).rawBits();
 }
