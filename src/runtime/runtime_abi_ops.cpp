@@ -103,7 +103,7 @@ int64_t brasslua_rt_obj_len(uint64_t v) {
 
 uint64_t brasslua_rt_closure_new(void* fn_ptr, void* unboxed_ptr, uint32_t upval_count, uint32_t arity) {
     auto& rt = RuntimeState::current();
-    LuaClosure* cl = rt.allocClosure(reinterpret_cast<LuaNativeFn>(fn_ptr), unboxed_ptr, upval_count, arity);
+    LuaClosure* cl = rt.allocClosure(reinterpret_cast<LuaNativeFn>(fn_ptr), unboxed_ptr, upval_count, arity, false);
     return Value::fromFunction(cl).rawBits();
 }
 
@@ -155,24 +155,38 @@ void brasslua_rt_close_local(uint64_t val) {
     brasslua_rt_call_2(mm.rawBits(), val, kNilBits);
 }
 
-uint64_t brasslua_rt_call(uint64_t callee, const uint64_t* args, int64_t nargs) {
-    auto& rt = RuntimeState::current();
-    Value cv(callee);
-    if (cv.isFunction()) {
-        auto* cl = static_cast<LuaClosure*>(cv.asPointer());
-        if (cl && cl->fn) {
-            rt.setMultiRet(nullptr, 0);
-            uint64_t r0 = cl->fn(cl, args, nargs);
-            if (rt.multiRetCount() == 0) {
-                rt.setMultiRet(&r0, 1);
-            }
-            return r0;
-        }
-    }
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>
+#define BRASSLUA_CLEAR_WIN64_SHADOW()                                           \
+    do {                                                                        \
+        auto* _caller_slots = reinterpret_cast<volatile uint64_t*>(             \
+            static_cast<char*>(_AddressOfReturnAddress()) + 8);                 \
+        _caller_slots[0] = 0;                                                   \
+        _caller_slots[1] = 0;                                                   \
+        _caller_slots[2] = 0;                                                   \
+        _caller_slots[3] = 0;                                                   \
+    } while (0)
+#else
+#define BRASSLUA_CLEAR_WIN64_SHADOW() ((void)0)
+#endif
+
+#if defined(_MSC_VER)
+#define BRASSLUA_NOINLINE __declspec(noinline)
+#else
+#define BRASSLUA_NOINLINE __attribute__((noinline))
+#endif
+
+static BRASSLUA_NOINLINE uint64_t callNonFunctionSlow(
+    RuntimeState& rt, uint64_t callee, const uint64_t* args, int64_t nargs) {
     if (rt.hostBridge().isHostObject && rt.hostBridge().isHostObject(callee) && rt.hostBridge().callHost) {
-        return rt.hostBridge().callHost(callee, kNilBits, args, static_cast<size_t>(nargs));
+        rt.clearMultiRet();
+        uint64_t r0 = rt.hostBridge().callHost(callee, kNilBits, args, static_cast<size_t>(nargs));
+        if (!rt.isMultiRetSet()) {
+            rt.setMultiRet(&r0, 1);
+        }
+        return r0;
     }
-    Value mm = lookupMetamethod(rt, cv, "__call");
+    Value mm = lookupMetamethod(rt, Value(callee), "__call");
     if (!mm.isNil()) {
         std::vector<uint64_t> full_args;
         full_args.reserve(static_cast<size_t>(nargs) + 1);
@@ -185,43 +199,159 @@ uint64_t brasslua_rt_call(uint64_t callee, const uint64_t* args, int64_t nargs) 
     throw LuaRuntimeError("attempt to call a non-function value");
 }
 
+uint64_t brasslua_rt_call(uint64_t callee, const uint64_t* args, int64_t nargs) {
+    BRASSLUA_CLEAR_WIN64_SHADOW();
+    auto& rt = RuntimeState::current();
+    Value cv(callee);
+    if (cv.isFunction()) {
+        auto* cl = static_cast<LuaClosure*>(cv.asPointer());
+        if (cl && cl->fn) {
+            rt.clearMultiRet();
+            uint64_t r0 = cl->fn(cl, args, nargs);
+            if (!rt.isMultiRetSet()) {
+                rt.setSingleRet(r0);
+            }
+            return r0;
+        }
+    }
+    return callNonFunctionSlow(rt, callee, args, nargs);
+}
+
 uint64_t brasslua_rt_call_0(uint64_t callee) {
-    return brasslua_rt_call(callee, nullptr, 0);
+    BRASSLUA_CLEAR_WIN64_SHADOW();
+    auto& rt = RuntimeState::current();
+    Value cv(callee);
+    if (cv.isFunction()) {
+        auto* cl = static_cast<LuaClosure*>(cv.asPointer());
+        if (cl && cl->fn) {
+            rt.clearMultiRet();
+            uint64_t r0 = cl->fn(cl, nullptr, 0);
+            if (!rt.isMultiRetSet()) {
+                rt.setSingleRet(r0);
+            }
+            return r0;
+        }
+    }
+    return callNonFunctionSlow(rt, callee, nullptr, 0);
 }
 
 uint64_t brasslua_rt_call_1(uint64_t callee, uint64_t a0) {
-    uint64_t args[1] = {a0};
-    return brasslua_rt_call(callee, args, 1);
+    BRASSLUA_CLEAR_WIN64_SHADOW();
+    auto& rt = RuntimeState::current();
+    Value cv(callee);
+    if (cv.isFunction()) {
+        auto* cl = static_cast<LuaClosure*>(cv.asPointer());
+        if (cl && cl->fn) {
+            rt.clearMultiRet();
+            uint64_t r0 = cl->fn(cl, &a0, 1);
+            if (!rt.isMultiRetSet()) {
+                rt.setSingleRet(r0);
+            }
+            return r0;
+        }
+    }
+    return callNonFunctionSlow(rt, callee, &a0, 1);
 }
 
 uint64_t brasslua_rt_call_2(uint64_t callee, uint64_t a0, uint64_t a1) {
+    BRASSLUA_CLEAR_WIN64_SHADOW();
     uint64_t args[2] = {a0, a1};
-    return brasslua_rt_call(callee, args, 2);
+    auto& rt = RuntimeState::current();
+    Value cv(callee);
+    if (cv.isFunction()) {
+        auto* cl = static_cast<LuaClosure*>(cv.asPointer());
+        if (cl && cl->fn) {
+            rt.clearMultiRet();
+            uint64_t r0 = cl->fn(cl, args, 2);
+            if (!rt.isMultiRetSet()) {
+                rt.setSingleRet(r0);
+            }
+            return r0;
+        }
+    }
+    return callNonFunctionSlow(rt, callee, args, 2);
 }
 
 uint64_t brasslua_rt_call_3(uint64_t callee, uint64_t a0, uint64_t a1, uint64_t a2) {
+    BRASSLUA_CLEAR_WIN64_SHADOW();
     uint64_t args[3] = {a0, a1, a2};
-    return brasslua_rt_call(callee, args, 3);
+    auto& rt = RuntimeState::current();
+    Value cv(callee);
+    if (cv.isFunction()) {
+        auto* cl = static_cast<LuaClosure*>(cv.asPointer());
+        if (cl && cl->fn) {
+            rt.clearMultiRet();
+            uint64_t r0 = cl->fn(cl, args, 3);
+            if (!rt.isMultiRetSet()) {
+                rt.setSingleRet(r0);
+            }
+            return r0;
+        }
+    }
+    return callNonFunctionSlow(rt, callee, args, 3);
 }
 
 uint64_t brasslua_rt_call_4(uint64_t callee, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+    BRASSLUA_CLEAR_WIN64_SHADOW();
     uint64_t args[4] = {a0, a1, a2, a3};
-    return brasslua_rt_call(callee, args, 4);
+    auto& rt = RuntimeState::current();
+    Value cv(callee);
+    if (cv.isFunction()) {
+        auto* cl = static_cast<LuaClosure*>(cv.asPointer());
+        if (cl && cl->fn) {
+            rt.clearMultiRet();
+            uint64_t r0 = cl->fn(cl, args, 4);
+            if (!rt.isMultiRetSet()) {
+                rt.setSingleRet(r0);
+            }
+            return r0;
+        }
+    }
+    return callNonFunctionSlow(rt, callee, args, 4);
+}
+
+uint64_t brasslua_rt_call_multiret(uint64_t callee, const uint64_t* prefix_args, int64_t prefix_count) {
+    BRASSLUA_CLEAR_WIN64_SHADOW();
+    auto& rt = RuntimeState::current();
+    const auto& tail = rt.multiRetVec();
+    size_t pcount = prefix_count > 0 ? static_cast<size_t>(prefix_count) : 0;
+    size_t total = pcount + tail.size();
+    uint64_t stack_buf[16];
+    std::vector<uint64_t> heap_buf;
+    uint64_t* full_args = stack_buf;
+    if (total > 16) {
+        heap_buf.resize(total);
+        full_args = heap_buf.data();
+    }
+    for (size_t i = 0; i < pcount; ++i) {
+        full_args[i] = prefix_args[i];
+    }
+    for (size_t i = 0; i < tail.size(); ++i) {
+        full_args[pcount + i] = tail[i];
+    }
+    return brasslua_rt_call(callee, full_args, static_cast<int64_t>(total));
 }
 
 uint64_t brasslua_rt_call_method(uint64_t obj, uint32_t method_intern_id, uint32_t slot_hint,
                                  const uint64_t* args, int64_t nargs) {
+    BRASSLUA_CLEAR_WIN64_SHADOW();
     auto& rt = RuntimeState::current();
     // Rule 6: When calling a method on a host object (`obj:m(x)`), pass `obj` as the
     // explicit receiver (`this`) and `(x)` as the arguments!
     if (rt.hostBridge().isHostObject && rt.hostBridge().isHostObject(obj)) {
         std::string_view mname = rt.getStringById(method_intern_id);
         if (rt.hostBridge().callMethod) {
-            return rt.hostBridge().callMethod(obj, mname, args, static_cast<size_t>(nargs));
+            rt.clearMultiRet();
+            uint64_t r0 = rt.hostBridge().callMethod(obj, mname, args, static_cast<size_t>(nargs));
+            if (!rt.isMultiRetSet()) rt.setMultiRet(&r0, 1);
+            return r0;
         }
         if (rt.hostBridge().getProperty && rt.hostBridge().callHost) {
             uint64_t fn = rt.hostBridge().getProperty(obj, mname);
-            return rt.hostBridge().callHost(fn, obj, args, static_cast<size_t>(nargs));
+            rt.clearMultiRet();
+            uint64_t r0 = rt.hostBridge().callHost(fn, obj, args, static_cast<size_t>(nargs));
+            if (!rt.isMultiRetSet()) rt.setMultiRet(&r0, 1);
+            return r0;
         }
     }
     // Pure Lua table/value: look up `obj[method]` and pass `obj` as `self` (arg 1).
@@ -240,8 +370,61 @@ uint64_t brasslua_rt_call_method(uint64_t obj, uint32_t method_intern_id, uint32
     return brasslua_rt_call(callee, full_args, nargs + 1);
 }
 
+uint64_t brasslua_rt_call_method_multiret(uint64_t obj, uint32_t method_intern_id, uint32_t slot_hint,
+                                          const uint64_t* prefix_args, int64_t prefix_count) {
+    BRASSLUA_CLEAR_WIN64_SHADOW();
+    auto& rt = RuntimeState::current();
+    std::vector<uint64_t> tail = rt.multiRetVec();
+    size_t pcount = prefix_count > 0 ? static_cast<size_t>(prefix_count) : 0;
+    size_t total = pcount + tail.size();
+    uint64_t stack_buf[16];
+    std::vector<uint64_t> heap_buf;
+    uint64_t* full_args = stack_buf;
+    if (total > 16) {
+        heap_buf.resize(total);
+        full_args = heap_buf.data();
+    }
+    for (size_t i = 0; i < pcount; ++i) {
+        full_args[i] = prefix_args[i];
+    }
+    for (size_t i = 0; i < tail.size(); ++i) {
+        full_args[pcount + i] = tail[i];
+    }
+    return brasslua_rt_call_method(obj, method_intern_id, slot_hint, full_args, static_cast<int64_t>(total));
+}
+
 void brasslua_rt_set_multiret(const uint64_t* vals, int64_t count) {
     RuntimeState::current().setMultiRet(vals, count > 0 ? static_cast<size_t>(count) : 0);
+}
+
+void brasslua_rt_clear_multiret(void) {
+    RuntimeState::current().clearMultiRet();
+}
+
+uint64_t brasslua_rt_prepend_multiret(const uint64_t* prefix_vals, int64_t prefix_count) {
+    auto& rt = RuntimeState::current();
+    std::vector<uint64_t> tail = rt.multiRetVec();
+    size_t pcount = prefix_count > 0 ? static_cast<size_t>(prefix_count) : 0;
+    std::vector<uint64_t> combined;
+    combined.reserve(pcount + tail.size());
+    for (size_t i = 0; i < pcount; ++i) {
+        combined.push_back(prefix_vals[i]);
+    }
+    combined.insert(combined.end(), tail.begin(), tail.end());
+    rt.setMultiRet(combined.data(), combined.size());
+    return combined.empty() ? kNilBits : combined[0];
+}
+
+uint64_t brasslua_rt_set_vararg_multiret(const uint64_t* args_ptr, int64_t nargs, int64_t vararg_offset) {
+    auto& rt = RuntimeState::current();
+    if (!args_ptr || nargs <= vararg_offset) {
+        rt.setMultiRet(nullptr, 0);
+        return kNilBits;
+    }
+    int64_t count = nargs - vararg_offset;
+    const uint64_t* start = args_ptr + vararg_offset;
+    rt.setMultiRet(start, static_cast<size_t>(count));
+    return start[0];
 }
 
 int64_t brasslua_rt_get_multiret_count(void) {

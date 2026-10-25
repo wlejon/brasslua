@@ -10,9 +10,11 @@ struct alignas(8) LuaString {
     uint32_t hash = 0;
     uint32_t length = 0;
     uint32_t intern_id = 0;
-    uint32_t reserved = 0;
+    int32_t  slot_id = -1; // Cached inline slot index (0..15), -1 if unassigned, -2 if hash-only
     char data[]; // NUL-terminated 8-bit clean bytes (may contain embedded NULs)
 };
+
+inline constexpr uint64_t kTombstoneBits = kNilBits | 1ULL;
 
 struct alignas(8) LuaHashEntry {
     uint64_t key = kNilBits;
@@ -22,9 +24,11 @@ struct alignas(8) LuaHashEntry {
 // Fixed-offset hybrid Lua 5.4 table allocated on brass::gc::Heap:
 // 1. Contiguous 0-based `array_data` pointer (where Lua index `i` is `array_data[i - 1]`).
 // 2. 16 inline record slots (`slots[16]`) at fixed offset 32 for O(1) zero-hash field loads/stores.
-// 3. Heap-allocated `hash_data` array for arbitrary dynamic keys beyond the 16 inline slots.
+// 3. Open-addressed power-of-2 `hash_data` table for arbitrary dynamic keys beyond the 16 inline slots.
+// 4. 4 inline array elements (`inline_array[4]`) so small arrays `{a, b}` need 0 extra allocations.
 struct alignas(8) LuaTable {
     static constexpr size_t kInlineSlots = 16;
+    static constexpr uint32_t kInlineArrayCap = 4;
 
     uint64_t*     array_data = nullptr; // Offset 0:  contiguous storage on brass::gc::Heap for 1..array_cap
     uint32_t      array_cap  = 0;       // Offset 8:  allocated capacity of array_data
@@ -33,13 +37,20 @@ struct alignas(8) LuaTable {
     uint32_t      flags      = 0;       // Offset 20: metamethod bitmask (0 = no metatable/metamethods)
     LuaTable*     metatable  = nullptr; // Offset 24: metatable pointer
     uint64_t      slots[kInlineSlots];  // Offset 32..159: 16 inline record field slots
-    LuaHashEntry* hash_data  = nullptr; // Offset 160: overflow key/val entries on brass::gc::Heap
-    uint32_t      hash_len   = 0;       // Offset 168: number of entries in hash_data
-    uint32_t      hash_cap   = 0;       // Offset 172: capacity of hash_data
+    LuaHashEntry* hash_data  = nullptr; // Offset 160: open-addressed power-of-2 hash table on brass::gc::Heap
+    uint32_t      hash_len   = 0;       // Offset 168: number of occupied slots (live + tombstones) in hash_data
+    uint32_t      hash_cap   = 0;       // Offset 172: power-of-2 capacity of hash_data
+    uint32_t      cached_mt_flags = 0;  // Offset 176: cached metamethod bitmask when used as a metatable
+    uint32_t      reserved_pad    = 0;  // Offset 180
+    uint64_t      cached_index_mm = kNilBits; // Offset 184: cached __index value when used as a metatable
+    uint64_t      inline_array[kInlineArrayCap]; // Offset 192..223: inline small array storage
 
     void initInlineSlots() noexcept {
         for (size_t i = 0; i < kInlineSlots; ++i) {
             slots[i] = kNilBits;
+        }
+        for (size_t i = 0; i < kInlineArrayCap; ++i) {
+            inline_array[i] = kNilBits;
         }
     }
 };

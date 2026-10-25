@@ -73,12 +73,25 @@ int runRuntimeJitTests() {
                 local keep = { name = "alive" }
                 wt[1] = keep
                 wt[2] = { name = "ephemeral" }
-                collectgarbage("collect")
-                print(wt[1] == keep and wt[2] == nil)
+                local dropped = { name = "dropped_local" }
+                wt[3] = dropped
+                dropped = nil
+                do
+                    local scoped = { name = "scoped_local" }
+                    wt[4] = scoped
+                end
+                wt[5] = "strings_are_not_weak_collected"
+                wt[6] = 12345
+                collectgarbage()
+                print(wt[1] == keep and wt[2] == nil and wt[3] == nil and wt[4] == nil)
+                print(wt[5], wt[6])
             end
+            collectgarbage("collect")
+            print(wt[1] == nil)
             print(collectgarbage("isrunning"))
         )", ok);
-        EXPECT_TRUE(ok && out == "true\ntrue\n", "brass::gc::Heap allocation and collectgarbage work");
+        EXPECT_TRUE(ok && out == "true\nstrings_are_not_weak_collected\t12345\ntrue\ntrue\n",
+                    "brass::gc::Heap allocation and collectgarbage work");
     }
 
     // 3. Stackful Coroutines: create, resume, yield across nested calls, wrap (Rule 2)
@@ -192,6 +205,100 @@ int runRuntimeJitTests() {
         bool aot_ok = compileLuaToObjectFile("local x = 0 for i = 1, 100 do x = x + i end return x", obj_path);
         EXPECT_TRUE(aot_ok, "compileLuaToObjectFile emits native .o file");
         std::remove(obj_path.c_str());
+    }
+
+    // 7. Shadowed names in closures, per-iteration loop captures, and lexical scoping
+    {
+        bool ok = false;
+        std::string out = runAndCapture(R"(
+            local x = 100
+            local function shadow_local()
+                local x = 200
+                x = x + 5
+                return x
+            end
+            local function shadow_param(x)
+                x = x * 2
+                return x
+            end
+            local function nested_shadow()
+                local x = "mid"
+                local inner1 = function()
+                    local x = 7
+                    return x + 1
+                end
+                local inner2 = function()
+                    return x
+                end
+                return inner1(), inner2()
+            end
+            print(shadow_local(), x)
+            print(shadow_param(9), x)
+            print(x, nested_shadow())
+
+            local funcs = {}
+            for i = 1, 4 do
+                funcs[i] = function() return i * 10 end
+            end
+            print(funcs[1](), funcs[2](), funcs[3](), funcs[4]())
+
+            local x = x + 50
+            print(x)
+        )", ok);
+        std::string expected =
+            "205\t100\n"
+            "18\t100\n"
+            "100\t8\tmid\n"
+            "10\t20\t30\t40\n"
+            "150\n";
+        EXPECT_TRUE(ok && out == expected, "shadowed names in closures and loop captures work");
+    }
+
+    // 8. Multi-return expansion in `return a, f()`, `obj:m(..., f())`, varargs `...`, and nested >4-arg calls
+    {
+        bool ok = false;
+        std::string out = runAndCapture(R"(
+            local function multi3()
+                return 10, 20, 30
+            end
+            local function empty()
+            end
+            local function prepend_ret()
+                return 1, 2, multi3()
+            end
+            local function prepend_empty()
+                return 1, empty()
+            end
+            print(prepend_ret())
+            print(select("#", prepend_empty()), prepend_empty())
+            print(select("#", empty()))
+
+            local obj = { base = 100 }
+            function obj:sum_all(a, b, c, d, e)
+                return self.base + a + b + c + d + (e or 0)
+            end
+            print(obj:sum_all(1, 2, multi3()))
+
+            local function vararg_fn(a, b, ...)
+                local t = { a, ... }
+                return b, select("#", ...), table.concat(t, ","), ...
+            end
+            print(vararg_fn("A", "B", "C", "D", "E"))
+
+            local function sum6(a, b, c, d, e, f)
+                return a * 100000 + b * 10000 + c * 1000 + d * 100 + e * 10 + f
+            end
+            print(sum6(1, 2, 3, 4, sum6(0, 0, 0, 0, 0, 5), 6))
+        )", ok);
+        std::string expected =
+            "1\t2\t10\t20\t30\n"
+            "1\t1\n"
+            "0\n"
+            "163\n"
+            "B\t3\tA,C,D,E\tC\tD\tE\n"
+            "123456\n";
+        EXPECT_TRUE(ok && out == expected,
+                    "return a, f(), obj:m(..., f()), varargs, and nested >4-arg calls work");
     }
 
     return failures;

@@ -52,14 +52,14 @@ bool exprContainsClosure(const Expr& expr) noexcept {
         expr.node);
 }
 
-bool canUnrollLoopBody(const std::vector<StmtPtr>& stmts, const std::string& loop_var, bool in_nested_loop = false) noexcept {
+bool canUnrollLoopBody(const std::vector<StmtPtr>& stmts, uint32_t loop_var_sym, bool in_nested_loop = false) noexcept {
     for (const auto& sp : stmts) {
         bool ok = std::visit(
             [&](const auto& s) -> bool {
                 using T = std::decay_t<decltype(s)>;
                 if constexpr (std::is_same_v<T, LocalStmt>) {
                     for (const auto& v : s.vars) {
-                        if (v.is_close) return false;
+                        if (v.is_close || v.is_captured) return false;
                     }
                     for (const auto& ie : s.init) {
                         if (exprContainsClosure(*ie)) return false;
@@ -68,7 +68,7 @@ bool canUnrollLoopBody(const std::vector<StmtPtr>& stmts, const std::string& loo
                 } else if constexpr (std::is_same_v<T, AssignStmt>) {
                     for (const auto& te : s.targets) {
                         if (const auto* id = std::get_if<IdentExpr>(&te->node)) {
-                            if (id->name == loop_var) return false;
+                            if (id->symbol_id == loop_var_sym) return false;
                         }
                         if (exprContainsClosure(*te)) return false;
                     }
@@ -79,17 +79,18 @@ bool canUnrollLoopBody(const std::vector<StmtPtr>& stmts, const std::string& loo
                 } else if constexpr (std::is_same_v<T, ExprStmt>) {
                     return !exprContainsClosure(*s.expr);
                 } else if constexpr (std::is_same_v<T, BlockStmt>) {
-                    return canUnrollLoopBody(s.body, loop_var, in_nested_loop);
+                    return canUnrollLoopBody(s.body, loop_var_sym, in_nested_loop);
                 } else if constexpr (std::is_same_v<T, IfStmt>) {
                     for (const auto& br : s.branches) {
                         if (exprContainsClosure(*br.condition)) return false;
-                        if (!canUnrollLoopBody(br.body, loop_var, in_nested_loop)) return false;
+                        if (!canUnrollLoopBody(br.body, loop_var_sym, in_nested_loop)) return false;
                     }
-                    return canUnrollLoopBody(s.else_body, loop_var, in_nested_loop);
+                    return canUnrollLoopBody(s.else_body, loop_var_sym, in_nested_loop);
                 } else if constexpr (std::is_same_v<T, NumericForStmt>) {
+                    if (s.var_is_captured) return false;
                     if (exprContainsClosure(*s.start) || exprContainsClosure(*s.stop)) return false;
                     if (s.step && exprContainsClosure(*s.step)) return false;
-                    return canUnrollLoopBody(s.body, loop_var, true);
+                    return canUnrollLoopBody(s.body, loop_var_sym, true);
                 } else if constexpr (std::is_same_v<T, BreakStmt>) {
                     return in_nested_loop;
                 } else {
@@ -140,17 +141,10 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
 
                 for (size_t i = 0; i < s.vars.size(); ++i) {
                     const LocalAttr& vattr = s.vars[i];
-                    Rep rep = vattr.is_close ? Rep::Boxed : repForInferredType(vattr.inferred_type);
-
-                    // Check if pre-allocated as top-level upvalue
-                    LocalVarInfo* existing = nullptr;
-                    auto it = st.scopes.back().find(vattr.name);
-                    if (it != st.scopes.back().end() && it->second.is_upvalue) {
-                        existing = &it->second;
-                    }
-                    if (!existing) {
-                        defineLocal(st, vattr.name, rep, false, vattr.is_close);
-                    }
+                    Rep rep = (vattr.is_close || vattr.is_captured)
+                                  ? Rep::Boxed
+                                  : repForInferredType(vattr.inferred_type);
+                    defineLocal(st, vattr.symbol_id, rep, vattr.is_captured, vattr.is_close);
 
                     MirValue rhs_mv;
                     if (i < init_vals.size()) {
@@ -168,7 +162,7 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                     } else {
                         rhs_mv = MirValue{b.build_iconst_i64(static_cast<int64_t>(kNilBits)), Rep::Boxed};
                     }
-                    storeVar(st, vattr.name, 0, rhs_mv);
+                    storeVar(st, vattr.symbol_id, vattr.name, 0, rhs_mv);
                 }
             } else if constexpr (std::is_same_v<T, AssignStmt>) {
                 bool expand_last = !s.values.empty() && s.targets.size() > s.values.size() &&
@@ -203,7 +197,7 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 for (size_t i = 0; i < s.targets.size(); ++i) {
                     const Expr& tgt = *s.targets[i];
                     if (const auto* id = std::get_if<IdentExpr>(&tgt.node)) {
-                        storeVar(st, id->name, id->intern_id, final_rhs[i]);
+                        storeVar(st, id->symbol_id, id->name, id->intern_id, final_rhs[i]);
                     } else if (const auto* idx = std::get_if<IndexExpr>(&tgt.node)) {
                         lowerIndexStore(st, *idx, final_rhs[i], tgt.inferred_type);
                     } else if (const auto* fld = std::get_if<FieldExpr>(&tgt.node)) {
@@ -290,9 +284,11 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 if (!st.isTerminated()) {
                     MirValue cond_mv = lowerExpr(st, *s.until_cond);
                     BValue* cond_bit = emitTruthinessBit(st, cond_mv);
+                    popScope(st);
                     b.build_br_if(cond_bit, end_bb, body_bb);
+                } else {
+                    popScope(st);
                 }
-                popScope(st);
                 st.loops.pop_back();
                 b.position_at_end(end_bb);
             } else if constexpr (std::is_same_v<T, NumericForStmt>) {
@@ -321,18 +317,18 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                                   stop_i->defining_instruction()->opcode() == brass::Opcode::iconst_i64;
                     bool step_c = step_i && step_i->is_instruction() &&
                                   step_i->defining_instruction()->opcode() == brass::Opcode::iconst_i64;
-                    if (start_c && stop_c && step_c) {
+                    if (!s.var_is_captured && start_c && stop_c && step_c) {
                         int64_t a = start_i->defining_instruction()->imm_i64();
                         int64_t b_lim = stop_i->defining_instruction()->imm_i64();
                         int64_t stp = step_i->defining_instruction()->imm_i64();
                         if (stp > 0 && a <= b_lim + 16 && (b_lim - a) / stp < 8 &&
-                            canUnrollLoopBody(s.body, s.var_name)) {
+                            canUnrollLoopBody(s.body, s.var_symbol_id)) {
                             for (int64_t cur = a; cur <= b_lim; cur += stp) {
                                 pushScope(st);
-                                LocalVarInfo loop_var = defineLocal(st, s.var_name, Rep::Int64, false);
+                                LocalVarInfo loop_var = defineLocal(st, s.var_symbol_id, Rep::Int64, false);
                                 loop_var.has_const_int = true;
                                 loop_var.const_int = cur;
-                                st.scopes.back()[s.var_name] = loop_var;
+                                st.scopes.back()[s.var_symbol_id] = loop_var;
                                 b.build_store(Type::i64(), loop_var.slot_ptr, 0, b.build_iconst_i64(cur));
                                 lowerBlockStmts(st, s.body);
                                 popScope(st);
@@ -367,8 +363,8 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                     b.position_at_end(body_bb);
                     st.loops.push_back(LoopContext{end_bb});
                     pushScope(st);
-                    LocalVarInfo loop_var = defineLocal(st, s.var_name, Rep::Int64, false);
-                    b.build_store(Type::i64(), loop_var.slot_ptr, 0, cur_i);
+                    defineLocal(st, s.var_symbol_id, Rep::Int64, s.var_is_captured);
+                    storeVar(st, s.var_symbol_id, s.var_name, 0, MirValue{cur_i, Rep::Int64});
                     lowerBlockStmts(st, s.body);
                     popScope(st);
                     st.loops.pop_back();
@@ -408,8 +404,8 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                     b.position_at_end(body_bb);
                     st.loops.push_back(LoopContext{end_bb});
                     pushScope(st);
-                    LocalVarInfo loop_var = defineLocal(st, s.var_name, Rep::Float64, false);
-                    b.build_store(Type::f64(), loop_var.slot_ptr, 0, cur_f);
+                    defineLocal(st, s.var_symbol_id, Rep::Float64, s.var_is_captured);
+                    storeVar(st, s.var_symbol_id, s.var_name, 0, MirValue{cur_f, Rep::Float64});
                     lowerBlockStmts(st, s.body);
                     popScope(st);
                     st.loops.pop_back();
@@ -463,12 +459,14 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 st.loops.push_back(LoopContext{end_bb});
                 pushScope(st);
                 for (size_t i = 0; i < s.var_names.size(); ++i) {
-                    LocalVarInfo lvi = defineLocal(st, s.var_names[i], Rep::Boxed, false);
+                    uint32_t sym_id = i < s.var_symbol_ids.size() ? s.var_symbol_ids[i] : 0;
+                    bool cap = i < s.var_is_captured.size() ? s.var_is_captured[i] : false;
+                    defineLocal(st, sym_id, Rep::Boxed, cap);
                     BValue* mv = (i == 0)
                                     ? next_ctrl
                                     : b.build_call("brasslua_rt_get_multiret", Type::i64(),
                                                    {b.build_iconst_i64(static_cast<int64_t>(i))});
-                    b.build_store(Type::i64(), lvi.slot_ptr, 0, mv);
+                    storeVar(st, sym_id, s.var_names[i], 0, MirValue{mv, Rep::Boxed});
                 }
                 lowerBlockStmts(st, s.body);
                 popScope(st);
@@ -480,25 +478,24 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
             } else if constexpr (std::is_same_v<T, FuncDefStmt>) {
                 std::string debug_name = (s.path.size() == 1 && s.method.empty()) ? s.path[0] : "";
                 if (s.is_local && !debug_name.empty()) {
-                    if (!lookupLocal(st, debug_name)) {
-                        defineLocal(st, debug_name, Rep::Boxed, false);
-                    }
+                    defineLocal(st, s.root_symbol_id, Rep::Boxed, s.root_is_captured);
                 }
-                CompiledFuncSig sig = compileFuncBody(&st, debug_name, s.func, !s.method.empty());
+                uint32_t fn_sym_id = (s.path.size() == 1 && s.method.empty()) ? s.root_symbol_id : 0;
+                CompiledFuncSig sig = compileFuncBody(&st, debug_name, fn_sym_id, s.func, !s.method.empty());
                 BValue* fn_addr = b.build_func_addr(sig.boxed_symbol);
                 BValue* unboxed_addr = sig.has_unboxed ? b.build_func_addr(sig.unboxed_symbol)
                                                       : b.build_iconst_i64(0);
-                BValue* uv_cnt = b.build_iconst_i32(static_cast<int32_t>(sig.captured_names.size()));
+                BValue* uv_cnt = b.build_iconst_i32(static_cast<int32_t>(sig.captured_vars.size()));
                 BValue* arity_c = b.build_iconst_i32(static_cast<int32_t>(sig.arity));
                 BValue* cl_bits = b.build_call("brasslua_rt_closure_new", Type::i64(),
                                               {fn_addr, unboxed_addr, uv_cnt, arity_c});
 
-                if (!sig.captured_names.empty()) {
+                if (!sig.captured_vars.empty()) {
                     BValue* payload_mask = b.build_iconst_i64(static_cast<int64_t>(kPayloadMask));
                     BValue* cl_ptr = b.build_and(cl_bits, payload_mask);
                     BValue* uvs_ptr = b.build_load(Type::ptr(), cl_ptr, static_cast<int32_t>(offsetof(LuaClosure, upvalues)));
-                    for (size_t u = 0; u < sig.captured_names.size(); ++u) {
-                        LocalVarInfo* ploc = lookupLocal(st, sig.captured_names[u]);
+                    for (size_t u = 0; u < sig.captured_vars.size(); ++u) {
+                        LocalVarInfo* ploc = lookupLocal(st, sig.captured_vars[u].symbol_id);
                         if (ploc && ploc->is_upvalue) {
                             BValue* uv_ptr = ploc->slot_ptr;
                             if (!uv_ptr && st.closure_arg) {
@@ -515,9 +512,9 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 }
 
                 if (s.path.size() == 1 && s.method.empty()) {
-                    storeVar(st, s.path[0], 0, MirValue{cl_bits, Rep::Boxed});
+                    storeVar(st, s.root_symbol_id, s.path[0], 0, MirValue{cl_bits, Rep::Boxed});
                 } else if (!s.path.empty()) {
-                    MirValue base = loadVar(st, s.path[0], 0);
+                    MirValue base = loadVar(st, s.root_symbol_id, s.path[0], 0);
                     for (size_t i = 1; i + (s.method.empty() ? 1 : 0) < s.path.size(); ++i) {
                         uint32_t id = rt_.internString(s.path[i]);
                         int32_t slot = rt_.getOrAssignFieldSlot(id);
@@ -533,7 +530,7 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                     BValue* base_bits = emitBox(st, base);
                     BValue* id_c = b.build_iconst_i32(static_cast<int32_t>(fid));
                     BValue* slot_c = b.build_iconst_i32(fslot >= 0 ? fslot : static_cast<int32_t>(0xFFFFFFFFu));
-                    b.build_call("brasslua_rt_table_set_field", Type::void_type(), {base_bits, id_c, slot_c, cl_bits});
+                    b.build_call("brasslua_rt_table_set_field", Type::i64(), {base_bits, id_c, slot_c, cl_bits});
                 }
             } else if constexpr (std::is_same_v<T, ReturnStmt>) {
                 if (st.is_unboxed_variant) {
@@ -556,12 +553,14 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 }
 
                 if (s.values.empty()) {
-                    b.build_call("brasslua_rt_set_multiret", Type::void_type(), {st.getArgsScratch(), b.build_iconst_i64(0)});
+                    BValue* zero = b.build_iconst_i64(0);
+                    b.build_call("brasslua_rt_set_multiret", Type::void_type(), {zero, zero});
                     b.build_ret(b.build_iconst_i64(static_cast<int64_t>(kNilBits)));
                     return;
                 }
 
-                // Tail call (`return f(...)` or `return obj:m(...)`): forward multi-return buffer untouched
+                // Tail call or vararg (`return f(...)`, `return obj:m(...)`, `return ...`):
+                // forward multi-return buffer untouched
                 if (s.values.size() == 1 && isCallOrVararg(*s.values[0])) {
                     MirValue mv = lowerMultiExpr(st, *s.values[0]);
                     BValue* boxed = emitBox(st, mv);
@@ -572,16 +571,51 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 if (s.values.size() == 1) {
                     MirValue mv = lowerExpr(st, *s.values[0]);
                     BValue* boxed = emitBox(st, mv);
-                    BValue* scratch = st.getArgsScratch();
-                    b.build_store(Type::i64(), scratch, 0, boxed);
-                    b.build_call("brasslua_rt_set_multiret", Type::void_type(), {scratch, b.build_iconst_i64(1)});
+                    bool func_has_multiret_call = false;
+                    for (const auto& blk : st.fn->blocks()) {
+                        for (const auto* inst : *blk) {
+                            if (inst->opcode() == brass::Opcode::call) {
+                                std::string_view callee = inst->symbol();
+                                if (callee != "brasslua_rt_box_int64" &&
+                                    callee != "brasslua_rt_to_number" &&
+                                    callee != "brasslua_rt_to_int64" &&
+                                    callee != "brasslua_rt_upvalue_new" &&
+                                    callee != "brasslua_rt_upvalue_get" &&
+                                    callee != "brasslua_rt_upvalue_set" &&
+                                    callee != "brasslua_rt_closure_new" &&
+                                    callee != "brasslua_rt_table_new" &&
+                                    callee != "brasslua_rt_string_from_id") {
+                                    func_has_multiret_call = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (func_has_multiret_call) break;
+                    }
+                    if (func_has_multiret_call) {
+                        b.build_call("brasslua_rt_clear_multiret", Type::void_type(), {});
+                    }
                     b.build_ret(boxed);
                     return;
                 }
 
-                BValue* ret_buf = s.values.size() > 14
-                                     ? st.emitEntryAlloca(static_cast<uint32_t>(s.values.size() * 8), 8)
-                                     : st.getArgsScratch();
+                bool last_is_multiret = isCallOrVararg(*s.values.back());
+                if (last_is_multiret) {
+                    size_t fixed_count = s.values.size() - 1;
+                    BValue* ret_buf = st.emitEntryAlloca(static_cast<uint32_t>(fixed_count * 8), 8);
+                    for (size_t i = 0; i < fixed_count; ++i) {
+                        MirValue mv = lowerExpr(st, *s.values[i]);
+                        BValue* boxed = emitBox(st, mv);
+                        b.build_store(Type::i64(), ret_buf, static_cast<int32_t>(i * 8), boxed);
+                    }
+                    (void)lowerMultiExpr(st, *s.values.back());
+                    BValue* r0 = b.build_call("brasslua_rt_prepend_multiret", Type::i64(),
+                                              {ret_buf, b.build_iconst_i64(static_cast<int64_t>(fixed_count))});
+                    b.build_ret(r0);
+                    return;
+                }
+
+                BValue* ret_buf = st.emitEntryAlloca(static_cast<uint32_t>(s.values.size() * 8), 8);
                 BValue* r0 = nullptr;
                 for (size_t i = 0; i < s.values.size(); ++i) {
                     MirValue mv = lowerExpr(st, *s.values[i]);

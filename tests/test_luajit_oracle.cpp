@@ -193,6 +193,74 @@ int runLuaOracleTests() {
                 print(s, #s, string.sub(s, 1, 5))
             )"
         },
+        {
+            "lua54_shadowing_multiret_and_nested_calls",
+            "lua5.4",
+            R"(
+                local x = 10
+                local function f()
+                    local x = 20
+                    local function g()
+                        local x = 30
+                        return x
+                    end
+                    return x, g()
+                end
+                print(f(), x)
+
+                local function pair_plus(a)
+                    return a, a + 1, a + 2
+                end
+                local function prefix_ret(x, y)
+                    return x, y, pair_plus(100)
+                end
+                print(prefix_ret(1, 2))
+
+                local Box = { offset = 1000 }
+                function Box:collect(a, b, c, d, e)
+                    return self.offset + a + b + c + d + e
+                end
+                print(Box:collect(1, 2, pair_plus(10)))
+
+                local function take7(a, b, c, d, e, f, g)
+                    return table.concat({a, b, c, d, e, f, g}, "-")
+                end
+                print(take7(1, 2, 3, 4, take7(5, 6, 7, 8, 9, 10, 11), 12, 13))
+            )"
+        },
+        {
+            "lua54_gmatch_captures_hash_and_oop",
+            "lua5.4",
+            R"LUA(
+                local words = {}
+                for k, v in string.gmatch("foo=10, bar=20, baz=30", "(%a+)=(%d+)") do
+                    words[#words + 1] = k .. ":" .. v
+                end
+                print(table.concat(words, "|"))
+
+                local s1, e1, c1, c2 = string.find("hello 123 world", "(%a+) (%d+)")
+                print(s1, e1, c1, c2)
+
+                local p1, m1, p2 = string.match("  abc  ", "()(%a+)()")
+                print(p1, m1, p2)
+
+                local sub_s, sub_n = string.gsub("a=1 b=2", "(%a)=(%d)", "%2->%1")
+                print(sub_s, sub_n)
+
+                local bal = string.match("x (a (b) c) y", "%b()")
+                print(bal)
+
+                local dict = {}
+                for i = 1, 200 do
+                    dict["key_" .. i] = i * 3
+                end
+                local dsum = 0
+                for i = 1, 200 do
+                    dsum = dsum + dict["key_" .. i]
+                end
+                print(dsum)
+            )LUA"
+        },
     };
 
     for (const auto& tc : cases) {

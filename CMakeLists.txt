@@ -58,6 +58,7 @@ find_package(Threads REQUIRED)
 add_library(brasslua STATIC
     src/lex/lexer.cpp
     src/parse/parser.cpp
+    src/sema/symbol_resolve.cpp
     src/sema/type_infer.cpp
     src/runtime/runtime_state.cpp
     src/runtime/runtime_abi.cpp
@@ -66,6 +67,7 @@ add_library(brasslua STATIC
     src/runtime/stdlib_math_bit.cpp
     src/runtime/stdlib_string_table.cpp
     src/codegen/mir_lowering.cpp
+    src/codegen/mir_lowering_table.cpp
     src/codegen/mir_lowering_expr.cpp
     src/codegen/mir_lowering_stmt.cpp
     src/codegen/jit_runner.cpp

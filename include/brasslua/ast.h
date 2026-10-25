@@ -75,6 +75,7 @@ struct VarargExpr {};
 struct IdentExpr {
     std::string name;
     uint32_t intern_id = 0;
+    uint32_t symbol_id = 0; // 0 = global (_ENV), >0 = lexical local/upvalue
 };
 
 struct UnaryExpr {
@@ -127,13 +128,25 @@ struct MethodCallExpr {
     std::vector<ExprPtr> args;
 };
 
+struct CapturedVar {
+    uint32_t symbol_id = 0;
+    std::string name;
+    bool captured_by_inner = false;
+};
+
 struct FuncBody {
     std::vector<std::string> params;
+    std::vector<uint32_t> param_symbol_ids;
+    std::vector<uint8_t> param_is_captured;
+    uint32_t self_symbol_id = 0;
+    bool self_is_captured = false;
     bool is_vararg = false;
+    bool has_inner_closures = false;
     std::vector<StmtPtr> body;
     std::vector<InferredType> param_types;
     InferredType return_type = InferredType::Unknown;
     bool can_unbox = false;
+    std::vector<CapturedVar> captured_vars;
 };
 
 struct FuncExpr {
@@ -175,6 +188,8 @@ struct LocalAttr {
     bool is_const = false;
     bool is_close = false;
     InferredType inferred_type = InferredType::Unknown;
+    uint32_t symbol_id = 0;
+    bool is_captured = false;
 };
 
 struct LocalStmt {
@@ -222,12 +237,16 @@ struct NumericForStmt {
     ExprPtr step; // may be null (default 1)
     std::vector<StmtPtr> body;
     bool is_int_loop = false;
+    uint32_t var_symbol_id = 0;
+    bool var_is_captured = false;
 };
 
 struct GenericForStmt {
     std::vector<std::string> var_names;
     std::vector<ExprPtr> iter_exprs;
     std::vector<StmtPtr> body;
+    std::vector<uint32_t> var_symbol_ids;
+    std::vector<uint8_t> var_is_captured;
 };
 
 struct FuncDefStmt {
@@ -235,6 +254,8 @@ struct FuncDefStmt {
     std::string method;            // non-empty for function a.b:m()
     bool is_local = false;
     FuncBody func;
+    uint32_t root_symbol_id = 0;   // symbol_id of path[0] (0 if global)
+    bool root_is_captured = false; // for is_local: whether this local function var is captured
 };
 
 struct ReturnStmt {

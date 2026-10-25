@@ -287,14 +287,40 @@ bool matchSingle(unsigned char c, std::string_view pat, size_t p, size_t& next_p
     return c == static_cast<unsigned char>(pat[p]);
 }
 
+struct PatternCapture {
+    size_t start = 0;
+    size_t len = 0; // kCapUnfinished or kCapPosition
+};
+constexpr size_t kCapUnfinished = static_cast<size_t>(-1);
+constexpr size_t kCapPosition   = static_cast<size_t>(-2);
+
+uint64_t captureToValue(RuntimeState& rt, std::string_view s, const PatternCapture& cap) {
+    if (cap.len == kCapPosition) {
+        return Value::fromInt64(static_cast<int64_t>(cap.start + 1)).rawBits();
+    }
+    return rt.makeStringValue(s.substr(cap.start, cap.len));
+}
+
 bool matchHere(std::string_view s, size_t si, std::string_view pat, size_t pi,
-               size_t& out_end, std::vector<std::string>& captures) {
+               size_t& out_end, std::vector<PatternCapture>& captures) {
     while (pi < pat.size()) {
         if (pat[pi] == '(') {
-            ++pi;
+            if (pi + 1 < pat.size() && pat[pi + 1] == ')') {
+                captures.push_back(PatternCapture{si, kCapPosition});
+                pi += 2;
+            } else {
+                captures.push_back(PatternCapture{si, kCapUnfinished});
+                ++pi;
+            }
             continue;
         }
         if (pat[pi] == ')') {
+            for (size_t k = captures.size(); k > 0; --k) {
+                if (captures[k - 1].len == kCapUnfinished) {
+                    captures[k - 1].len = si - captures[k - 1].start;
+                    break;
+                }
+            }
             ++pi;
             continue;
         }
@@ -304,6 +330,43 @@ bool matchHere(std::string_view s, size_t si, std::string_view pat, size_t pi,
                 return true;
             }
             return false;
+        }
+        if (pat[pi] == '%' && pi + 1 < pat.size()) {
+            char next_c = pat[pi + 1];
+            if (next_c == 'b' && pi + 3 < pat.size()) {
+                char open_c = pat[pi + 2];
+                char close_c = pat[pi + 3];
+                if (si >= s.size() || s[si] != open_c) return false;
+                int depth = 1;
+                size_t k = si + 1;
+                while (k < s.size()) {
+                    if (s[k] == close_c) {
+                        if (--depth == 0) {
+                            si = k + 1;
+                            pi += 4;
+                            break;
+                        }
+                    } else if (s[k] == open_c) {
+                        ++depth;
+                    }
+                    ++k;
+                }
+                if (depth != 0) return false;
+                continue;
+            }
+            if (next_c >= '1' && next_c <= '9') {
+                size_t cap_idx = static_cast<size_t>(next_c - '1');
+                if (cap_idx >= captures.size() || captures[cap_idx].len >= kCapPosition) {
+                    return false;
+                }
+                std::string_view cap_sv = s.substr(captures[cap_idx].start, captures[cap_idx].len);
+                if (si + cap_sv.size() <= s.size() && s.substr(si, cap_sv.size()) == cap_sv) {
+                    si += cap_sv.size();
+                    pi += 2;
+                    continue;
+                }
+                return false;
+            }
         }
         size_t item_end = pi;
         unsigned char dummy = 0;
@@ -319,7 +382,9 @@ bool matchHere(std::string_view s, size_t si, std::string_view pat, size_t pi,
                 ++si;
             }
             if (quant == '-') {
+                auto saved = captures;
                 for (size_t k = si; k <= s.size(); ++k) {
+                    captures = saved;
                     if (matchHere(s, k, pat, after_quant, out_end, captures)) return true;
                     size_t np = 0;
                     if (k == s.size() || !matchSingle(static_cast<unsigned char>(s[k]), pat, pi, np)) break;
@@ -328,8 +393,10 @@ bool matchHere(std::string_view s, size_t si, std::string_view pat, size_t pi,
             }
             if (quant == '?') {
                 size_t np = 0;
+                auto saved = captures;
                 if (si < s.size() && matchSingle(static_cast<unsigned char>(s[si]), pat, pi, np)) {
                     if (matchHere(s, si + 1, pat, after_quant, out_end, captures)) return true;
+                    captures = saved;
                 }
                 return matchHere(s, si, pat, after_quant, out_end, captures);
             }
@@ -340,7 +407,9 @@ bool matchHere(std::string_view s, size_t si, std::string_view pat, size_t pi,
                 if (!matchSingle(static_cast<unsigned char>(s[max_si]), pat, pi, np)) break;
                 ++max_si;
             }
+            auto saved = captures;
             for (size_t k = max_si; k >= si; --k) {
+                captures = saved;
                 if (matchHere(s, k, pat, after_quant, out_end, captures)) return true;
                 if (k == si) break;
             }
@@ -359,7 +428,8 @@ bool matchHere(std::string_view s, size_t si, std::string_view pat, size_t pi,
 }
 
 bool findPattern(std::string_view s, std::string_view pat, size_t start_pos, bool plain,
-                 size_t& match_start, size_t& match_end) {
+                 size_t& match_start, size_t& match_end, std::vector<PatternCapture>& out_captures) {
+    out_captures.clear();
     if (plain) {
         size_t pos = s.find(pat, start_pos);
         if (pos == std::string_view::npos) return false;
@@ -371,14 +441,15 @@ bool findPattern(std::string_view s, std::string_view pat, size_t start_pos, boo
     std::string_view eff_pat = anchored ? pat.substr(1) : pat;
     for (size_t i = start_pos; i <= s.size(); ++i) {
         size_t end_pos = 0;
-        std::vector<std::string> caps;
-        if (matchHere(s, i, eff_pat, 0, end_pos, caps)) {
+        out_captures.clear();
+        if (matchHere(s, i, eff_pat, 0, end_pos, out_captures)) {
             match_start = i;
             match_end = end_pos;
             return true;
         }
         if (anchored) break;
     }
+    out_captures.clear();
     return false;
 }
 
@@ -391,13 +462,18 @@ uint64_t strFind(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     if (static_cast<size_t>(init) > s.size() + 1) return returnMulti(rt, {kNilBits});
     bool plain = (nargs >= 4 && Value(args[3]).isTruthy());
     size_t ms = 0, me = 0;
-    if (!findPattern(s, pat, static_cast<size_t>(init - 1), plain, ms, me)) {
+    std::vector<PatternCapture> caps;
+    if (!findPattern(s, pat, static_cast<size_t>(init - 1), plain, ms, me, caps)) {
         return returnMulti(rt, {kNilBits});
     }
-    return returnMulti(rt, {
-        Value::fromInt64(static_cast<int64_t>(ms + 1)).rawBits(),
-        Value::fromInt64(static_cast<int64_t>(me)).rawBits()
-    });
+    std::vector<uint64_t> res;
+    res.reserve(2 + caps.size());
+    res.push_back(Value::fromInt64(static_cast<int64_t>(ms + 1)).rawBits());
+    res.push_back(Value::fromInt64(static_cast<int64_t>(me)).rawBits());
+    for (const auto& c : caps) {
+        res.push_back(captureToValue(rt, s, c));
+    }
+    return returnMulti(rt, res);
 }
 
 uint64_t strMatch(void* /*cl*/, const uint64_t* args, int64_t nargs) {
@@ -408,10 +484,77 @@ uint64_t strMatch(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     if (init < 1) init = 1;
     if (static_cast<size_t>(init) > s.size() + 1) return kNilBits;
     size_t ms = 0, me = 0;
-    if (!findPattern(s, pat, static_cast<size_t>(init - 1), false, ms, me)) {
+    std::vector<PatternCapture> caps;
+    if (!findPattern(s, pat, static_cast<size_t>(init - 1), false, ms, me, caps)) {
         return kNilBits;
     }
-    return rt.makeStringValue(std::string_view(s.data() + ms, me - ms));
+    if (caps.empty()) {
+        return rt.makeStringValue(std::string_view(s.data() + ms, me - ms));
+    }
+    if (caps.size() == 1) {
+        return captureToValue(rt, s, caps[0]);
+    }
+    std::vector<uint64_t> res;
+    res.reserve(caps.size());
+    for (const auto& c : caps) {
+        res.push_back(captureToValue(rt, s, c));
+    }
+    return returnMulti(rt, res);
+}
+
+uint64_t strGmatchIter(void* cl_ptr, const uint64_t* /*args*/, int64_t /*nargs*/) {
+    auto& rt = RuntimeState::current();
+    auto* cl = static_cast<LuaClosure*>(cl_ptr);
+    if (!cl || cl->upvalue_count < 4) return kNilBits;
+    std::string_view s = valueToStringView(rt, Value(cl->upvalues[0]->value));
+    std::string_view pat = valueToStringView(rt, Value(cl->upvalues[1]->value));
+    int64_t pos = Value(cl->upvalues[2]->value).asInt64();
+    int64_t last_end = Value(cl->upvalues[3]->value).asInt64();
+    if (pos < 0 || static_cast<size_t>(pos) > s.size()) {
+        return kNilBits;
+    }
+    size_t search_pos = static_cast<size_t>(pos);
+    std::vector<PatternCapture> caps;
+    while (search_pos <= s.size()) {
+        size_t ms = 0, me = 0;
+        if (!findPattern(s, pat, search_pos, false, ms, me, caps)) {
+            break;
+        }
+        if (me == ms && static_cast<int64_t>(me) == last_end) {
+            search_pos = ms + 1;
+            continue;
+        }
+        cl->upvalues[2]->value = Value::fromInt64(static_cast<int64_t>(me)).rawBits();
+        cl->upvalues[3]->value = Value::fromInt64(static_cast<int64_t>(me)).rawBits();
+        if (caps.empty()) {
+            return rt.makeStringValue(s.substr(ms, me - ms));
+        }
+        if (caps.size() == 1) {
+            return captureToValue(rt, s, caps[0]);
+        }
+        std::vector<uint64_t> res;
+        res.reserve(caps.size());
+        for (const auto& c : caps) {
+            res.push_back(captureToValue(rt, s, c));
+        }
+        return returnMulti(rt, res);
+    }
+    cl->upvalues[2]->value = Value::fromInt64(static_cast<int64_t>(s.size() + 1)).rawBits();
+    return kNilBits;
+}
+
+uint64_t strGmatch(void* /*cl*/, const uint64_t* args, int64_t nargs) {
+    auto& rt = RuntimeState::current();
+    std::string s = argStr(rt, args, nargs, 0);
+    std::string pat = argStr(rt, args, nargs, 1);
+    int64_t init = posRelat((nargs >= 3 && !Value(args[2]).isNil()) ? Value(args[2]).asInt64() : 1, s.size());
+    if (init < 1) init = 1;
+    LuaClosure* iter = rt.allocClosure(&strGmatchIter, nullptr, 4, 0, true);
+    iter->upvalues[0]->value = rt.makeStringValue(s);
+    iter->upvalues[1]->value = rt.makeStringValue(pat);
+    iter->upvalues[2]->value = Value::fromInt64(init - 1).rawBits();
+    iter->upvalues[3]->value = Value::fromInt64(-1).rawBits();
+    return Value::fromFunction(iter).rawBits();
 }
 
 uint64_t strGsub(void* /*cl*/, const uint64_t* args, int64_t nargs) {
@@ -424,19 +567,32 @@ uint64_t strGsub(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     std::string out;
     int64_t count = 0;
     size_t pos = 0;
+    std::vector<PatternCapture> caps;
     while (count < max_n && pos <= s.size()) {
         size_t ms = 0, me = 0;
-        if (!findPattern(s, pat, pos, false, ms, me)) break;
+        if (!findPattern(s, pat, pos, false, ms, me, caps)) break;
         out.append(s.data() + pos, ms - pos);
-        std::string matched(s.data() + ms, me - ms);
+        std::string_view matched(s.data() + ms, me - ms);
         if (repl.isString() || repl.isNumeric()) {
             std::string rstr = valueToStdString(rt, repl);
             for (size_t k = 0; k < rstr.size(); ++k) {
                 if (rstr[k] == '%' && k + 1 < rstr.size()) {
-                    if (rstr[k + 1] == '0' || rstr[k + 1] == '1') {
+                    char nc = rstr[k + 1];
+                    if (nc == '0') {
                         out.append(matched);
+                    } else if (nc >= '1' && nc <= '9') {
+                        size_t idx = static_cast<size_t>(nc - '1');
+                        if (idx == 0 && caps.empty()) {
+                            out.append(matched);
+                        } else if (idx < caps.size()) {
+                            if (caps[idx].len == kCapPosition) {
+                                out.append(std::to_string(caps[idx].start + 1));
+                            } else {
+                                out.append(s.data() + caps[idx].start, caps[idx].len);
+                            }
+                        }
                     } else {
-                        out.push_back(rstr[k + 1]);
+                        out.push_back(nc);
                     }
                     ++k;
                 } else {
@@ -444,14 +600,30 @@ uint64_t strGsub(void* /*cl*/, const uint64_t* args, int64_t nargs) {
                 }
             }
         } else if (repl.isFunction()) {
-            uint64_t res = brasslua_rt_call_1(repl.rawBits(), rt.makeStringValue(matched));
+            uint64_t res = kNilBits;
+            if (caps.empty()) {
+                res = brasslua_rt_call_1(repl.rawBits(), rt.makeStringValue(matched));
+            } else {
+                uint64_t stack_args[8];
+                std::vector<uint64_t> heap_args;
+                uint64_t* cargs = stack_args;
+                if (caps.size() > 8) {
+                    heap_args.resize(caps.size());
+                    cargs = heap_args.data();
+                }
+                for (size_t i = 0; i < caps.size(); ++i) {
+                    cargs[i] = captureToValue(rt, s, caps[i]);
+                }
+                res = brasslua_rt_call(repl.rawBits(), cargs, static_cast<int64_t>(caps.size()));
+            }
             if (Value(res).isTruthy()) {
                 out.append(valueToStdString(rt, Value(res)));
             } else {
                 out.append(matched);
             }
         } else if (repl.isTable()) {
-            uint64_t res = brasslua_rt_table_get(repl.rawBits(), rt.makeStringValue(matched));
+            uint64_t key = caps.empty() ? rt.makeStringValue(matched) : captureToValue(rt, s, caps[0]);
+            uint64_t res = brasslua_rt_table_get(repl.rawBits(), key);
             if (Value(res).isTruthy()) {
                 out.append(valueToStdString(rt, Value(res)));
             } else {
@@ -539,17 +711,34 @@ uint64_t tblSort(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     int64_t len = brasslua_rt_table_len(tbl_bits);
     if (len <= 1) return kNilBits;
 
-    std::vector<uint64_t> elems(static_cast<size_t>(len));
-    for (int64_t i = 1; i <= len; ++i) {
-        elems[static_cast<size_t>(i - 1)] = brasslua_rt_table_get_int(tbl_bits, i);
-    }
-    std::sort(elems.begin(), elems.end(), [&](uint64_t a, uint64_t b) {
+    LuaClosure* comp_cl = Value(comp).isFunction()
+                              ? static_cast<LuaClosure*>(Value(comp).asPointer())
+                              : nullptr;
+    auto cmp_fn = [&](uint64_t a, uint64_t b) -> bool {
+        if (comp_cl && comp_cl->fn) {
+            uint64_t cmp_args[2] = {a, b};
+            uint64_t res = comp_cl->fn(comp_cl, cmp_args, 2);
+            return Value(res).isTruthy();
+        }
         if (!Value(comp).isNil()) {
             uint64_t res = brasslua_rt_call_2(comp, a, b);
             return Value(res).isTruthy();
         }
         return brasslua_rt_lt(a, b) != 0;
-    });
+    };
+
+    auto* tbl = static_cast<LuaTable*>(Value(tbl_bits).asPointer());
+    if (tbl && (tbl->flags & (kMetaIndex | kMetaNewIndex | kMetaLen)) == 0 &&
+        static_cast<uint64_t>(len) <= tbl->array_cap) {
+        std::sort(tbl->array_data, tbl->array_data + len, cmp_fn);
+        return kNilBits;
+    }
+
+    std::vector<uint64_t> elems(static_cast<size_t>(len));
+    for (int64_t i = 1; i <= len; ++i) {
+        elems[static_cast<size_t>(i - 1)] = brasslua_rt_table_get_int(tbl_bits, i);
+    }
+    std::sort(elems.begin(), elems.end(), cmp_fn);
     for (int64_t i = 1; i <= len; ++i) {
         brasslua_rt_table_set_int(tbl_bits, i, elems[static_cast<size_t>(i - 1)]);
     }
@@ -637,6 +826,7 @@ void registerStringAndTableStdlib(RuntimeState& rt) {
     setTableFieldStr(rt, str_tbl, "format", makeNativeClosure(rt, &strFormat, 1));
     setTableFieldStr(rt, str_tbl, "find", makeNativeClosure(rt, &strFind, 2));
     setTableFieldStr(rt, str_tbl, "match", makeNativeClosure(rt, &strMatch, 2));
+    setTableFieldStr(rt, str_tbl, "gmatch", makeNativeClosure(rt, &strGmatch, 2));
     setTableFieldStr(rt, str_tbl, "gsub", makeNativeClosure(rt, &strGsub, 3));
     rt.setGlobal("string", Value::fromTable(str_tbl));
 

@@ -68,19 +68,32 @@ public:
     LuaTable* allocTable(uint32_t array_hint = 0, uint32_t hash_hint = 0);
     void ensureTableArrayCapacity(LuaTable* tbl, uint32_t min_cap);
     void ensureTableHashCapacity(LuaTable* tbl, uint32_t min_cap);
-    LuaClosure* allocClosure(LuaNativeFn fn, void* unboxed_fn, uint32_t upval_count, uint32_t arity);
+    LuaClosure* allocClosure(LuaNativeFn fn, void* unboxed_fn, uint32_t upval_count, uint32_t arity,
+                             bool init_upvalues = true);
     LuaUpvalue* allocUpvalue(uint64_t initial_val);
     LuaBoxedInt64* allocBoxedInt64(int64_t val);
     LuaCoroutine* allocCoroutine(LuaClosure* entry);
     LuaUserdata* allocUserdata(size_t size, uint32_t type_tag = 0);
 
-    // Multi-return scratch buffer
-    void setMultiRet(const uint64_t* vals, size_t count);
-    size_t multiRetCount() const noexcept { return multiret_.size(); }
-    uint64_t getMultiRet(size_t idx) const noexcept {
-        return idx < multiret_.size() ? multiret_[idx] : kNilBits;
+    // Multi-return scratch buffer (mode 0 = unset, 1 = single_ret_, 2 = multiret_ vector)
+    void clearMultiRet() noexcept {
+        multiret_mode_ = 0;
     }
-    const std::vector<uint64_t>& multiRetVec() const noexcept { return multiret_; }
+    void setSingleRet(uint64_t val) noexcept {
+        single_ret_ = val;
+        multiret_mode_ = 1;
+    }
+    void setMultiRet(const uint64_t* vals, size_t count);
+    bool isMultiRetSet() const noexcept { return multiret_mode_ != 0; }
+    size_t multiRetCount() const noexcept {
+        if (multiret_mode_ == 1) return 1;
+        return multiret_mode_ == 2 ? multiret_.size() : 0;
+    }
+    uint64_t getMultiRet(size_t idx) const noexcept {
+        if (multiret_mode_ == 1) return idx == 0 ? single_ret_ : kNilBits;
+        return (multiret_mode_ == 2 && idx < multiret_.size()) ? multiret_[idx] : kNilBits;
+    }
+    const std::vector<uint64_t>& multiRetVec();
 
     // Host bridge registration (for bronze / bro integration)
     void setHostBridge(HostBridge bridge) { host_bridge_ = std::move(bridge); }
@@ -103,6 +116,8 @@ private:
 
     Impl* impl_;
     std::vector<uint64_t> multiret_;
+    uint64_t single_ret_ = kNilBits;
+    uint8_t multiret_mode_ = 0;
     HostBridge host_bridge_;
     std::function<void(std::string_view)> output_cb_;
 };
@@ -111,6 +126,7 @@ private:
 Chunk parseLuaSource(std::string_view source, std::string_view source_name = "=stdin");
 
 // Sema & Type/Shape Inference
+void resolveChunkSymbols(Chunk& chunk);
 void analyzeAndInferTypes(Chunk& chunk, RuntimeState& rt);
 
 // JIT & AOT Execution Engine (backed by brass)

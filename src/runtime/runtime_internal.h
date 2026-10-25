@@ -37,8 +37,23 @@ enum MetaFlag : uint32_t {
     kMetaWeakKeys   = 1u << 25,
     kMetaWeakValues = 1u << 26,
     kMetaGcArmed    = 1u << 27,
+    kMetaProtected  = 1u << 28,
+    kMetaCacheValid = 1u << 29,
     kMetaNonTable   = 1u << 31,
+    kMetaTableFlagsMask = (1u << 27) - 1u,
 };
+
+inline uint32_t hashLuaKey(uint64_t key_bits) noexcept {
+    Value k(key_bits);
+    if (k.isString()) {
+        return static_cast<const LuaString*>(k.asPointer())->hash;
+    }
+    uint64_t x = k.isBoxedInt64() ? static_cast<uint64_t>(k.asInt64()) : key_bits;
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    return static_cast<uint32_t>(x ^ (x >> 31));
+}
 
 struct LuaRuntimeError : public std::runtime_error {
     Value error_value;
@@ -57,6 +72,7 @@ LuaCoroutine* getRunningCoroutine(RuntimeState& rt) noexcept;
 void setRunningCoroutine(RuntimeState& rt, LuaCoroutine* co) noexcept;
 
 void recomputeMetatableFlags(RuntimeState& rt, LuaTable* tbl);
+uint32_t getOrComputeMetatableFlags(RuntimeState& rt, LuaTable* mt);
 Value lookupMetamethod(RuntimeState& rt, Value obj, std::string_view event);
 void armTableFinalizerIfNeeded(RuntimeState& rt, LuaTable* tbl);
 

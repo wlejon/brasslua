@@ -10,11 +10,12 @@ extern "C" {
 // ---- Table operations ----
 uint64_t brasslua_rt_table_new(uint32_t array_hint, uint32_t hash_hint);
 uint64_t brasslua_rt_table_get(uint64_t table, uint64_t key);
-void     brasslua_rt_table_set(uint64_t table, uint64_t key, uint64_t val);
+uint64_t brasslua_rt_table_set(uint64_t table, uint64_t key, uint64_t val);
 uint64_t brasslua_rt_table_get_int(uint64_t table, int64_t idx);
-void     brasslua_rt_table_set_int(uint64_t table, int64_t idx, uint64_t val);
+uint64_t brasslua_rt_table_set_int(uint64_t table, int64_t idx, uint64_t val);
 uint64_t brasslua_rt_table_get_field(uint64_t table, uint32_t intern_id, uint32_t slot_hint);
-void     brasslua_rt_table_set_field(uint64_t table, uint32_t intern_id, uint32_t slot_hint, uint64_t val);
+uint64_t brasslua_rt_table_set_field(uint64_t table, uint32_t intern_id, uint32_t slot_hint, uint64_t val);
+uint64_t brasslua_rt_table_append_multiret(uint64_t table, int64_t start_idx);
 int64_t  brasslua_rt_table_len(uint64_t table);
 uint64_t brasslua_rt_rawget(uint64_t table, uint64_t key);
 uint64_t brasslua_rt_rawset(uint64_t table, uint64_t key, uint64_t val);
@@ -47,7 +48,13 @@ uint64_t brasslua_rt_call_4(uint64_t callee, uint64_t a0, uint64_t a1, uint64_t 
 // Explicit method call (`obj:method(...)`) where compiler statically knows receiver `obj`
 uint64_t brasslua_rt_call_method(uint64_t obj, uint32_t method_intern_id, uint32_t slot_hint,
                                  const uint64_t* args, int64_t nargs);
+uint64_t brasslua_rt_call_multiret(uint64_t callee, const uint64_t* prefix_args, int64_t prefix_count);
+uint64_t brasslua_rt_call_method_multiret(uint64_t obj, uint32_t method_intern_id, uint32_t slot_hint,
+                                          const uint64_t* prefix_args, int64_t prefix_count);
 void     brasslua_rt_set_multiret(const uint64_t* vals, int64_t count);
+void     brasslua_rt_clear_multiret(void);
+uint64_t brasslua_rt_prepend_multiret(const uint64_t* prefix, int64_t prefix_count);
+uint64_t brasslua_rt_set_vararg_multiret(const uint64_t* args_ptr, int64_t nargs, int64_t vararg_offset);
 int64_t  brasslua_rt_get_multiret_count(void);
 uint64_t brasslua_rt_get_multiret(int64_t idx);
 

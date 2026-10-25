@@ -298,10 +298,195 @@ print(string.format("RESULT:%.6f", C[1] + C[N * N]))
 io.stderr:write(string.format("%.2f\n", dt))
 EOF
 
+cat > "${TMP_DIR}/sort.lua" << 'EOF'
+local N = 50000
+local arr = {}
+local function cmp(a, b) return a < b end
+local t0 = os.clock()
+local checksum = 0
+for r = 1, 10 do
+    local x = r * 12345
+    for i = 1, N do
+        x = (x * 1664525 + 1013904223) % 2147483648
+        arr[i] = x
+    end
+    table.sort(arr, cmp)
+    checksum = (checksum + arr[1] + arr[25000] + arr[N]) % 1000000007
+end
+local dt = (os.clock() - t0) * 1000.0
+print(string.format("RESULT:%d", checksum))
+io.stderr:write(string.format("%.2f\n", dt))
+EOF
+
+cat > "${TMP_DIR}/binary_trees.lua" << 'EOF'
+local function bottom_up_tree(depth)
+    if depth > 0 then
+        depth = depth - 1
+        local left = bottom_up_tree(depth)
+        local right = bottom_up_tree(depth)
+        return { left, right }
+    else
+        return { false, false }
+    end
+end
+
+local function item_check(tree)
+    if tree[1] then
+        return 1 + item_check(tree[1]) + item_check(tree[2])
+    else
+        return 1
+    end
+end
+
+local t0 = os.clock()
+local min_depth = 4
+local max_depth = 13
+local stretch_depth = max_depth + 1
+local total = item_check(bottom_up_tree(stretch_depth))
+local long_lived = bottom_up_tree(max_depth)
+for depth = min_depth, max_depth, 2 do
+    local iterations = 2 ^ (max_depth - depth + min_depth)
+    local check = 0
+    for i = 1, iterations do
+        check = check + item_check(bottom_up_tree(depth))
+    end
+    total = total + check
+end
+total = total + item_check(long_lived)
+local dt = (os.clock() - t0) * 1000.0
+print(string.format("RESULT:%d", total))
+io.stderr:write(string.format("%.2f\n", dt))
+EOF
+
+cat > "${TMP_DIR}/coroutines.lua" << 'EOF'
+local create = coroutine.create
+local resume = coroutine.resume
+local yield = coroutine.yield
+
+local function worker(n)
+    local acc = 0
+    for i = 1, n do
+        acc = acc + yield(i)
+    end
+    return acc
+end
+
+local t0 = os.clock()
+local total = 0
+for c = 1, 200 do
+    local co = create(worker)
+    local ok, v = resume(co, 500)
+    while ok and v do
+        total = total + v
+        ok, v = resume(co, 2)
+    end
+end
+local dt = (os.clock() - t0) * 1000.0
+print(string.format("RESULT:%d", total))
+io.stderr:write(string.format("%.2f\n", dt))
+EOF
+
+cat > "${TMP_DIR}/closures.lua" << 'EOF'
+local function make_adder(x)
+    return function(y)
+        return x + y
+    end
+end
+
+local function make_counter(init)
+    local c = init
+    return function(step)
+        c = c + step
+        return c
+    end
+end
+
+local t0 = os.clock()
+local sum = 0
+local f = make_adder(7)
+local cnt = make_counter(0)
+for i = 1, 2000000 do
+    sum = sum + f(i) + cnt(1)
+end
+local dt = (os.clock() - t0) * 1000.0
+print(string.format("RESULT:%d", sum))
+io.stderr:write(string.format("%.2f\n", dt))
+EOF
+
+cat > "${TMP_DIR}/hash.lua" << 'EOF'
+local t0 = os.clock()
+local tbl = {}
+local keys = {}
+local N = 5000
+for i = 1, N do
+    local k = "field_key_" .. tostring(i)
+    keys[i] = k
+    tbl[k] = i
+end
+local sum = 0
+for r = 1, 200 do
+    for i = 1, N do
+        local k = keys[i]
+        local v = tbl[k]
+        tbl[k] = v + 1
+        sum = sum + v
+    end
+end
+local dt = (os.clock() - t0) * 1000.0
+print(string.format("RESULT:%d", sum))
+io.stderr:write(string.format("%.2f\n", dt))
+EOF
+
+cat > "${TMP_DIR}/oop.lua" << 'EOF'
+local Class = {}
+Class.__index = Class
+for i = 1, 500 do
+    Class["helper_" .. tostring(i)] = function(self) return i end
+end
+function Class.new(x, y)
+    return setmetatable({ x = x, y = y }, Class)
+end
+function Class:move(dx, dy)
+    self.x = self.x + dx
+    self.y = self.y + dy
+    return self.x + self.y
+end
+
+local t0 = os.clock()
+local sum = 0
+for i = 1, 200000 do
+    local obj = Class.new(i, i * 2)
+    sum = sum + obj:move(3, 5)
+end
+local dt = (os.clock() - t0) * 1000.0
+print(string.format("RESULT:%d", sum))
+io.stderr:write(string.format("%.2f\n", dt))
+EOF
+
+cat > "${TMP_DIR}/strings.lua" << 'EOF'
+local t0 = os.clock()
+local parts = {}
+for i = 1, 2000 do
+    parts[i] = string.format("item_%d=%d", i, i * 3)
+end
+local big = table.concat(parts, ";")
+local sum = 0
+for r = 1, 50 do
+    for k, v in string.gmatch(big, "item_(%d+)=(%d+)") do
+        sum = sum + tonumber(k) + tonumber(v)
+    end
+end
+local replaced, nrep = string.gsub(big, "item_(%d+)=(%d+)", "%1:%2")
+sum = sum + #replaced + nrep
+local dt = (os.clock() - t0) * 1000.0
+print(string.format("RESULT:%d", sum))
+io.stderr:write(string.format("%.2f\n", dt))
+EOF
+
 printf "%-16s | %12s | %12s | %12s | %s\n" "Benchmark" "brasslua(ms)" "luajit(ms)" "lua5.4(ms)" "Oracle"
 printf "%-16s-+-%12s-+-%12s-+-%12s-+-%s\n" "----------------" "------------" "------------" "------------" "------"
 
-BENCHES=(fib harmonic mandelbrot spectral_norm nbody sieve fannkuch bitops matmul)
+BENCHES=(fib harmonic mandelbrot spectral_norm nbody sieve fannkuch bitops matmul sort binary_trees coroutines closures hash oop strings)
 
 for b in "${BENCHES[@]}"; do
     f="${TMP_DIR}/${b}.lua"

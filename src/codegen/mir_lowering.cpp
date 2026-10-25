@@ -8,175 +8,6 @@ using brass::BasicBlock;
 using brass::Function;
 using brass::Type;
 
-namespace {
-
-void collectIdentifiersInStmts(const std::vector<StmtPtr>& stmts, std::unordered_set<std::string>& out);
-
-void collectIdentifiersInExpr(const Expr& expr, std::unordered_set<std::string>& out) {
-    std::visit(
-        [&](const auto& e) {
-            using T = std::decay_t<decltype(e)>;
-            if constexpr (std::is_same_v<T, IdentExpr>) {
-                out.insert(e.name);
-            } else if constexpr (std::is_same_v<T, UnaryExpr>) {
-                collectIdentifiersInExpr(*e.operand, out);
-            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-                collectIdentifiersInExpr(*e.lhs, out);
-                collectIdentifiersInExpr(*e.rhs, out);
-            } else if constexpr (std::is_same_v<T, TableExpr>) {
-                for (const auto& f : e.fields) {
-                    if (f.key) collectIdentifiersInExpr(*f.key, out);
-                    if (f.value) collectIdentifiersInExpr(*f.value, out);
-                }
-            } else if constexpr (std::is_same_v<T, IndexExpr>) {
-                collectIdentifiersInExpr(*e.table, out);
-                collectIdentifiersInExpr(*e.index, out);
-            } else if constexpr (std::is_same_v<T, FieldExpr>) {
-                collectIdentifiersInExpr(*e.table, out);
-            } else if constexpr (std::is_same_v<T, CallExpr>) {
-                collectIdentifiersInExpr(*e.callee, out);
-                for (const auto& a : e.args) collectIdentifiersInExpr(*a, out);
-            } else if constexpr (std::is_same_v<T, MethodCallExpr>) {
-                collectIdentifiersInExpr(*e.object, out);
-                for (const auto& a : e.args) collectIdentifiersInExpr(*a, out);
-            } else if constexpr (std::is_same_v<T, FuncExpr>) {
-                collectIdentifiersInStmts(e.func.body, out);
-            }
-        },
-        expr.node);
-}
-
-void collectIdentifiersInStmt(const Stmt& stmt, std::unordered_set<std::string>& out) {
-    std::visit(
-        [&](const auto& s) {
-            using T = std::decay_t<decltype(s)>;
-            if constexpr (std::is_same_v<T, LocalStmt>) {
-                for (const auto& e : s.init) collectIdentifiersInExpr(*e, out);
-            } else if constexpr (std::is_same_v<T, AssignStmt>) {
-                for (const auto& t : s.targets) collectIdentifiersInExpr(*t, out);
-                for (const auto& v : s.values) collectIdentifiersInExpr(*v, out);
-            } else if constexpr (std::is_same_v<T, ExprStmt>) {
-                collectIdentifiersInExpr(*s.expr, out);
-            } else if constexpr (std::is_same_v<T, BlockStmt>) {
-                collectIdentifiersInStmts(s.body, out);
-            } else if constexpr (std::is_same_v<T, IfStmt>) {
-                for (const auto& br : s.branches) {
-                    collectIdentifiersInExpr(*br.condition, out);
-                    collectIdentifiersInStmts(br.body, out);
-                }
-                collectIdentifiersInStmts(s.else_body, out);
-            } else if constexpr (std::is_same_v<T, WhileStmt>) {
-                collectIdentifiersInExpr(*s.condition, out);
-                collectIdentifiersInStmts(s.body, out);
-            } else if constexpr (std::is_same_v<T, RepeatStmt>) {
-                collectIdentifiersInStmts(s.body, out);
-                collectIdentifiersInExpr(*s.until_cond, out);
-            } else if constexpr (std::is_same_v<T, NumericForStmt>) {
-                collectIdentifiersInExpr(*s.start, out);
-                collectIdentifiersInExpr(*s.stop, out);
-                if (s.step) collectIdentifiersInExpr(*s.step, out);
-                collectIdentifiersInStmts(s.body, out);
-            } else if constexpr (std::is_same_v<T, GenericForStmt>) {
-                for (const auto& ie : s.iter_exprs) collectIdentifiersInExpr(*ie, out);
-                collectIdentifiersInStmts(s.body, out);
-            } else if constexpr (std::is_same_v<T, FuncDefStmt>) {
-                for (const auto& p : s.path) out.insert(p);
-                collectIdentifiersInStmts(s.func.body, out);
-            } else if constexpr (std::is_same_v<T, ReturnStmt>) {
-                for (const auto& v : s.values) collectIdentifiersInExpr(*v, out);
-            }
-        },
-        stmt.node);
-}
-
-void collectIdentifiersInStmts(const std::vector<StmtPtr>& stmts, std::unordered_set<std::string>& out) {
-    for (const auto& s : stmts) {
-        collectIdentifiersInStmt(*s, out);
-    }
-}
-
-void collectInnerFunctionRefs(const std::vector<StmtPtr>& stmts, std::unordered_set<std::string>& out);
-
-void collectInnerFunctionRefsInExpr(const Expr& expr, std::unordered_set<std::string>& out) {
-    std::visit(
-        [&](const auto& e) {
-            using T = std::decay_t<decltype(e)>;
-            if constexpr (std::is_same_v<T, FuncExpr>) {
-                collectIdentifiersInStmts(e.func.body, out);
-                collectInnerFunctionRefs(e.func.body, out);
-            } else if constexpr (std::is_same_v<T, UnaryExpr>) {
-                collectInnerFunctionRefsInExpr(*e.operand, out);
-            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-                collectInnerFunctionRefsInExpr(*e.lhs, out);
-                collectInnerFunctionRefsInExpr(*e.rhs, out);
-            } else if constexpr (std::is_same_v<T, TableExpr>) {
-                for (const auto& f : e.fields) {
-                    if (f.key) collectInnerFunctionRefsInExpr(*f.key, out);
-                    if (f.value) collectInnerFunctionRefsInExpr(*f.value, out);
-                }
-            } else if constexpr (std::is_same_v<T, IndexExpr>) {
-                collectInnerFunctionRefsInExpr(*e.table, out);
-                collectInnerFunctionRefsInExpr(*e.index, out);
-            } else if constexpr (std::is_same_v<T, FieldExpr>) {
-                collectInnerFunctionRefsInExpr(*e.table, out);
-            } else if constexpr (std::is_same_v<T, CallExpr>) {
-                collectInnerFunctionRefsInExpr(*e.callee, out);
-                for (const auto& a : e.args) collectInnerFunctionRefsInExpr(*a, out);
-            } else if constexpr (std::is_same_v<T, MethodCallExpr>) {
-                collectInnerFunctionRefsInExpr(*e.object, out);
-                for (const auto& a : e.args) collectInnerFunctionRefsInExpr(*a, out);
-            }
-        },
-        expr.node);
-}
-
-void collectInnerFunctionRefs(const std::vector<StmtPtr>& stmts, std::unordered_set<std::string>& out) {
-    for (const auto& s : stmts) {
-        std::visit(
-            [&](const auto& node) {
-                using T = std::decay_t<decltype(node)>;
-                if constexpr (std::is_same_v<T, FuncDefStmt>) {
-                    collectIdentifiersInStmts(node.func.body, out);
-                    collectInnerFunctionRefs(node.func.body, out);
-                } else if constexpr (std::is_same_v<T, LocalStmt>) {
-                    for (const auto& e : node.init) collectInnerFunctionRefsInExpr(*e, out);
-                } else if constexpr (std::is_same_v<T, AssignStmt>) {
-                    for (const auto& t : node.targets) collectInnerFunctionRefsInExpr(*t, out);
-                    for (const auto& v : node.values) collectInnerFunctionRefsInExpr(*v, out);
-                } else if constexpr (std::is_same_v<T, ExprStmt>) {
-                    collectInnerFunctionRefsInExpr(*node.expr, out);
-                } else if constexpr (std::is_same_v<T, BlockStmt>) {
-                    collectInnerFunctionRefs(node.body, out);
-                } else if constexpr (std::is_same_v<T, IfStmt>) {
-                    for (const auto& br : node.branches) {
-                        collectInnerFunctionRefsInExpr(*br.condition, out);
-                        collectInnerFunctionRefs(br.body, out);
-                    }
-                    collectInnerFunctionRefs(node.else_body, out);
-                } else if constexpr (std::is_same_v<T, WhileStmt>) {
-                    collectInnerFunctionRefsInExpr(*node.condition, out);
-                    collectInnerFunctionRefs(node.body, out);
-                } else if constexpr (std::is_same_v<T, RepeatStmt>) {
-                    collectInnerFunctionRefs(node.body, out);
-                    collectInnerFunctionRefsInExpr(*node.until_cond, out);
-                } else if constexpr (std::is_same_v<T, NumericForStmt>) {
-                    collectInnerFunctionRefsInExpr(*node.start, out);
-                    collectInnerFunctionRefsInExpr(*node.stop, out);
-                    if (node.step) collectInnerFunctionRefsInExpr(*node.step, out);
-                    collectInnerFunctionRefs(node.body, out);
-                } else if constexpr (std::is_same_v<T, GenericForStmt>) {
-                    for (const auto& ie : node.iter_exprs) collectInnerFunctionRefsInExpr(*ie, out);
-                    collectInnerFunctionRefs(node.body, out);
-                } else if constexpr (std::is_same_v<T, ReturnStmt>) {
-                    for (const auto& v : node.values) collectInnerFunctionRefsInExpr(*v, out);
-                }
-            },
-            s->node);
-    }
-}
-
-} // namespace
-
 Rep MirModuleLowerer::repForInferredType(InferredType t) noexcept {
     switch (t) {
         case InferredType::Int64:
@@ -205,6 +36,7 @@ void MirModuleLowerer::declareRuntimeExternals() {
     decl("brasslua_rt_table_set_int");
     decl("brasslua_rt_table_get_field");
     decl("brasslua_rt_table_set_field");
+    decl("brasslua_rt_table_append_multiret");
     decl("brasslua_rt_table_len");
     decl("brasslua_rt_rawget");
     decl("brasslua_rt_rawset");
@@ -230,8 +62,13 @@ void MirModuleLowerer::declareRuntimeExternals() {
     decl("brasslua_rt_call_2");
     decl("brasslua_rt_call_3");
     decl("brasslua_rt_call_4");
+    decl("brasslua_rt_call_multiret");
     decl("brasslua_rt_call_method");
+    decl("brasslua_rt_call_method_multiret");
     decl("brasslua_rt_set_multiret");
+    decl("brasslua_rt_clear_multiret");
+    decl("brasslua_rt_prepend_multiret");
+    decl("brasslua_rt_set_vararg_multiret");
     decl("brasslua_rt_get_multiret_count");
     decl("brasslua_rt_get_multiret");
 
@@ -420,13 +257,24 @@ void MirModuleLowerer::pushScope(FunctionBuildState& st) {
 
 void MirModuleLowerer::popScope(FunctionBuildState& st) {
     if (st.scopes.size() > 1) {
+        if (!st.isTerminated()) {
+            BValue* zero = nullptr;
+            for (const auto& [sym_id, info] : st.scopes.back()) {
+                (void)sym_id;
+                if (!info.is_upvalue && info.rep == Rep::Boxed && info.slot_ptr) {
+                    if (!zero) zero = st.builder.build_iconst_i64(0);
+                    st.builder.build_store(Type::i64(), info.slot_ptr, 0, zero);
+                }
+            }
+        }
         st.scopes.pop_back();
     }
 }
 
-LocalVarInfo* MirModuleLowerer::lookupLocal(FunctionBuildState& st, const std::string& name) {
+LocalVarInfo* MirModuleLowerer::lookupLocal(FunctionBuildState& st, uint32_t symbol_id) {
+    if (symbol_id == 0) return nullptr;
     for (auto it = st.scopes.rbegin(); it != st.scopes.rend(); ++it) {
-        auto found = it->find(name);
+        auto found = it->find(symbol_id);
         if (found != it->end()) {
             return &found->second;
         }
@@ -434,7 +282,7 @@ LocalVarInfo* MirModuleLowerer::lookupLocal(FunctionBuildState& st, const std::s
     return nullptr;
 }
 
-LocalVarInfo MirModuleLowerer::defineLocal(FunctionBuildState& st, const std::string& name, Rep rep,
+LocalVarInfo MirModuleLowerer::defineLocal(FunctionBuildState& st, uint32_t symbol_id, Rep rep,
                                            bool as_upvalue, bool is_close) {
     auto& b = st.builder;
     LocalVarInfo info;
@@ -454,13 +302,14 @@ LocalVarInfo MirModuleLowerer::defineLocal(FunctionBuildState& st, const std::st
         info.is_upvalue = false;
         info.slot_ptr = st.emitEntryAlloca(8, 8);
     }
-    st.scopes.back()[name] = info;
+    st.scopes.back()[symbol_id] = info;
     return info;
 }
 
-MirValue MirModuleLowerer::loadVar(FunctionBuildState& st, const std::string& name, uint32_t intern_id) {
+MirValue MirModuleLowerer::loadVar(FunctionBuildState& st, uint32_t symbol_id,
+                                   const std::string& name, uint32_t intern_id) {
     auto& b = st.builder;
-    if (auto* loc = lookupLocal(st, name)) {
+    if (auto* loc = lookupLocal(st, symbol_id)) {
         if (loc->has_const_int) {
             return MirValue{b.build_iconst_i64(loc->const_int), Rep::Int64};
         }
@@ -476,13 +325,14 @@ MirValue MirModuleLowerer::loadVar(FunctionBuildState& st, const std::string& na
     return MirValue{gv, Rep::Boxed};
 }
 
-void MirModuleLowerer::storeVar(FunctionBuildState& st, const std::string& name, uint32_t intern_id, MirValue val) {
+void MirModuleLowerer::storeVar(FunctionBuildState& st, uint32_t symbol_id,
+                                const std::string& name, uint32_t intern_id, MirValue val) {
     auto& b = st.builder;
-    if (auto* loc = lookupLocal(st, name)) {
+    if (auto* loc = lookupLocal(st, symbol_id)) {
         loc->has_const_int = false;
         if (loc->is_upvalue) {
             BValue* boxed = emitBox(st, val);
-            if (val.rep != Rep::Boxed) {
+            if (val.rep != Rep::Boxed || !rt_.hostBridge().isHostObject) {
                 b.build_store(Type::i64(), loc->slot_ptr, 0, boxed);
             } else {
                 BValue* idx = b.build_iconst_i32(0);
@@ -504,6 +354,7 @@ void MirModuleLowerer::storeVar(FunctionBuildState& st, const std::string& name,
 
 CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
                                                   const std::string& debug_name,
+                                                  uint32_t func_symbol_id,
                                                   const FuncBody& fbody,
                                                   bool has_implicit_self) {
     uint32_t fn_id = next_fn_id_++;
@@ -512,22 +363,17 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
     sig.arity = static_cast<uint32_t>(fbody.params.size() + (has_implicit_self ? 1 : 0));
     sig.fbody = &fbody;
 
-    std::unordered_set<std::string> inner_refs;
-    collectInnerFunctionRefs(fbody.body, inner_refs);
-
     if (parent_st) {
-        std::unordered_set<std::string> used_ids;
-        collectIdentifiersInStmts(fbody.body, used_ids);
-        for (const auto& p : fbody.params) used_ids.erase(p);
-        if (has_implicit_self) used_ids.erase("self");
-        if (!debug_name.empty() && fbody.can_unbox) used_ids.erase(debug_name);
-
-        for (const auto& id : used_ids) {
-            auto kfit = known_functions_.find(id);
+        for (const CapturedVar& cv : fbody.captured_vars) {
+            std::string k = varKey(cv.symbol_id, cv.name);
+            auto kfit = known_functions_.find(k);
             if (kfit != known_functions_.end() && kfit->second.has_unboxed) {
                 continue;
             }
-            if (auto* ploc = lookupLocal(*parent_st, id)) {
+            if (func_symbol_id != 0 && cv.symbol_id == func_symbol_id && fbody.can_unbox) {
+                continue;
+            }
+            if (auto* ploc = lookupLocal(*parent_st, cv.symbol_id)) {
                 if (!ploc->is_upvalue) {
                     auto& pb = parent_st->builder;
                     BValue* cur_v = pb.build_load(mirTypeForRep(ploc->rep), ploc->slot_ptr, 0);
@@ -538,12 +384,12 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
                     ploc->is_upvalue = true;
                     ploc->upvalue_idx = 0;
                 }
-                sig.captured_names.push_back(id);
+                sig.captured_vars.push_back(cv);
             }
         }
     }
 
-    bool allow_unbox = fbody.can_unbox && !has_implicit_self && sig.captured_names.empty() && inner_refs.empty();
+    bool allow_unbox = fbody.can_unbox && !has_implicit_self && sig.captured_vars.empty() && !fbody.has_inner_closures;
     if (allow_unbox) {
         sig.has_unboxed = true;
         sig.unboxed_symbol = sig.boxed_symbol + "_unboxed";
@@ -557,7 +403,7 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
     }
 
     if (!debug_name.empty()) {
-        known_functions_[debug_name] = sig;
+        known_functions_[varKey(func_symbol_id, debug_name)] = sig;
     }
 
     // 1. Emit unboxed fast entry if eligible
@@ -572,6 +418,8 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
         ust.is_unboxed_variant = true;
         ust.expected_return_rep = sig.return_rep;
         ust.self_func_name = debug_name;
+        ust.self_func_symbol_id = func_symbol_id;
+        ust.vararg_offset = sig.arity;
         pushScope(ust);
 
         ust.builder.append_block("entry");
@@ -582,7 +430,8 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
 
         for (size_t i = 0; i < fbody.params.size(); ++i) {
             Rep pr = sig.param_reps[i];
-            LocalVarInfo linfo = defineLocal(ust, fbody.params[i], pr, false);
+            uint32_t psym = i < fbody.param_symbol_ids.size() ? fbody.param_symbol_ids[i] : 0;
+            LocalVarInfo linfo = defineLocal(ust, psym, pr, false);
             ust.builder.build_store(mirTypeForRep(pr), linfo.slot_ptr, 0, entry_params[i]);
         }
 
@@ -601,16 +450,17 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
     bst.is_unboxed_variant = false;
     bst.expected_return_rep = Rep::Boxed;
     bst.self_func_name = debug_name;
+    bst.self_func_symbol_id = func_symbol_id;
+    bst.vararg_offset = sig.arity;
     pushScope(bst);
 
     bst.builder.append_block("entry");
     bst.closure_arg = bst.builder.add_param(Type::ptr());
     bst.args_ptr_arg = bst.builder.add_param(Type::ptr());
     bst.nargs_arg = bst.builder.add_param(Type::i64());
-    bst.args_scratch = bst.builder.build_alloca(128, 8);
 
-    if (!sig.captured_names.empty()) {
-        std::unordered_set<std::string> assigned_in_body;
+    if (!sig.captured_vars.empty()) {
+        std::unordered_set<uint32_t> assigned_in_body;
         bool has_external_calls = false;
         auto checkExprCalls = [&](auto& self_e, const Expr& expr) -> void {
             std::visit(
@@ -635,7 +485,8 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
                         bool is_intrinsic = false;
                         if (const auto* fe = std::get_if<FieldExpr>(&e.callee->node)) {
                             if (const auto* b = std::get_if<IdentExpr>(&fe->table->node)) {
-                                if (b->name == "math" || b->name == "bit" || b->name == "bit32") {
+                                if (b->symbol_id == 0 &&
+                                    (b->name == "math" || b->name == "bit" || b->name == "bit32")) {
                                     is_intrinsic = true;
                                 }
                             }
@@ -655,7 +506,7 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
                 } else if (const auto* as = std::get_if<AssignStmt>(&sp->node)) {
                     for (const auto& te : as->targets) {
                         if (const auto* id = std::get_if<IdentExpr>(&te->node)) {
-                            assigned_in_body.insert(id->name);
+                            if (id->symbol_id != 0) assigned_in_body.insert(id->symbol_id);
                         }
                         checkExprCalls(checkExprCalls, *te);
                     }
@@ -693,13 +544,14 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
 
         BValue* uvs_ptr = bst.builder.build_load(
             Type::ptr(), bst.closure_arg, static_cast<int32_t>(offsetof(LuaClosure, upvalues)));
-        for (size_t u = 0; u < sig.captured_names.size(); ++u) {
-            const std::string& cap_name = sig.captured_names[u];
+        for (size_t u = 0; u < sig.captured_vars.size(); ++u) {
+            const CapturedVar& cap = sig.captured_vars[u];
             BValue* uv_ptr = bst.builder.build_load(
                 Type::ptr(), uvs_ptr, static_cast<int32_t>(u * 8));
-            if (inner_refs.empty() && !has_external_calls && assigned_in_body.count(cap_name) == 0) {
+            if (!fbody.has_inner_closures && !cap.captured_by_inner &&
+                !has_external_calls && assigned_in_body.count(cap.symbol_id) == 0) {
                 BValue* uv_val = bst.builder.build_load(Type::i64(), uv_ptr, 0);
-                LocalVarInfo linfo = defineLocal(bst, cap_name, Rep::Boxed, false);
+                LocalVarInfo linfo = defineLocal(bst, cap.symbol_id, Rep::Boxed, false);
                 bst.builder.build_store(Type::i64(), linfo.slot_ptr, 0, uv_val);
             } else {
                 LocalVarInfo uv_info;
@@ -707,7 +559,7 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
                 uv_info.rep = Rep::Boxed;
                 uv_info.is_upvalue = true;
                 uv_info.upvalue_idx = static_cast<uint32_t>(u);
-                bst.scopes.back()[cap_name] = uv_info;
+                bst.scopes.back()[cap.symbol_id] = uv_info;
             }
         }
     }
@@ -735,25 +587,33 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
 
     size_t arg_offset = 0;
     if (has_implicit_self) {
-        bool cap = inner_refs.count("self") != 0;
-        LocalVarInfo sinfo = defineLocal(bst, "self", Rep::Boxed, cap);
+        bool cap = fbody.self_is_captured;
+        defineLocal(bst, fbody.self_symbol_id, Rep::Boxed, cap);
         BValue* sv = loadBoxedArg(0);
-        storeVar(bst, "self", 0, MirValue{sv, Rep::Boxed});
-        (void)sinfo;
+        storeVar(bst, fbody.self_symbol_id, "self", 0, MirValue{sv, Rep::Boxed});
         arg_offset = 1;
     }
 
     for (size_t i = 0; i < fbody.params.size(); ++i) {
         const std::string& pname = fbody.params[i];
-        bool cap = inner_refs.count(pname) != 0;
+        uint32_t psym = i < fbody.param_symbol_ids.size() ? fbody.param_symbol_ids[i] : 0;
+        bool cap = i < fbody.param_is_captured.size() ? fbody.param_is_captured[i] : false;
+        BValue* raw_arg = loadBoxedArg(i + arg_offset);
+        if (cap) {
+            LocalVarInfo info;
+            info.rep = Rep::Boxed;
+            info.is_upvalue = true;
+            info.slot_ptr = bst.builder.build_call("brasslua_rt_upvalue_new", Type::ptr(), {raw_arg});
+            bst.scopes.back()[psym] = info;
+            continue;
+        }
         Rep prep = Rep::Boxed;
         size_t type_idx = i + arg_offset;
-        if (!cap && type_idx < fbody.param_types.size()) {
+        if (type_idx < fbody.param_types.size()) {
             prep = repForInferredType(fbody.param_types[type_idx]);
         }
-        defineLocal(bst, pname, prep, cap);
-        BValue* raw_arg = loadBoxedArg(i + arg_offset);
-        storeVar(bst, pname, 0, MirValue{raw_arg, Rep::Boxed});
+        defineLocal(bst, psym, prep, false);
+        storeVar(bst, psym, pname, 0, MirValue{raw_arg, Rep::Boxed});
     }
 
     lowerBlockStmts(bst, fbody.body);
@@ -762,6 +622,8 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
             BValue* cv = bst.builder.build_load(Type::i64(), *it, 0);
             bst.builder.build_call("brasslua_rt_close_local", Type::void_type(), {cv});
         }
+        BValue* zero = bst.builder.build_iconst_i64(0);
+        bst.builder.build_call("brasslua_rt_set_multiret", Type::void_type(), {zero, zero});
         BValue* nil_c = bst.builder.build_iconst_i64(static_cast<int64_t>(kNilBits));
         bst.builder.build_ret(nil_c);
     }
@@ -776,31 +638,13 @@ std::string MirModuleLowerer::lowerChunk(const Chunk& chunk) {
     FunctionBuildState bst(*bfn);
     bst.is_unboxed_variant = false;
     bst.expected_return_rep = Rep::Boxed;
+    bst.vararg_offset = 0;
     pushScope(bst);
-
-    std::unordered_set<std::string> inner_refs;
-    collectInnerFunctionRefs(chunk.body, inner_refs);
 
     bst.builder.append_block("entry");
     bst.closure_arg = bst.builder.add_param(Type::ptr());
     bst.args_ptr_arg = bst.builder.add_param(Type::ptr());
     bst.nargs_arg = bst.builder.add_param(Type::i64());
-    bst.args_scratch = bst.builder.build_alloca(128, 8);
-
-    // Pre-mark any top-level locals captured by inner closures
-    for (const auto& stmt : chunk.body) {
-        if (const auto* ls = std::get_if<LocalStmt>(&stmt->node)) {
-            for (const auto& v : ls->vars) {
-                if (inner_refs.count(v.name) != 0) {
-                    defineLocal(bst, v.name, Rep::Boxed, /*as_upvalue=*/true);
-                }
-            }
-        } else if (const auto* fs = std::get_if<FuncDefStmt>(&stmt->node)) {
-            if (fs->is_local && fs->path.size() == 1 && inner_refs.count(fs->path[0]) != 0) {
-                defineLocal(bst, fs->path[0], Rep::Boxed, /*as_upvalue=*/true);
-            }
-        }
-    }
 
     lowerBlockStmts(bst, chunk.body);
     if (!bst.isTerminated()) {
@@ -808,6 +652,8 @@ std::string MirModuleLowerer::lowerChunk(const Chunk& chunk) {
             BValue* cv = bst.builder.build_load(Type::i64(), *it, 0);
             bst.builder.build_call("brasslua_rt_close_local", Type::void_type(), {cv});
         }
+        BValue* zero = bst.builder.build_iconst_i64(0);
+        bst.builder.build_call("brasslua_rt_set_multiret", Type::void_type(), {zero, zero});
         BValue* nil_c = bst.builder.build_iconst_i64(static_cast<int64_t>(kNilBits));
         bst.builder.build_ret(nil_c);
     }

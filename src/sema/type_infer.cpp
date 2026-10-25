@@ -21,6 +21,13 @@ InferredType joinTypes(InferredType a, InferredType b) noexcept {
     return InferredType::Any;
 }
 
+std::string varKey(uint32_t symbol_id, const std::string& name) {
+    if (symbol_id != 0) {
+        return "#" + std::to_string(symbol_id);
+    }
+    return name;
+}
+
 struct VarBinding {
     InferredType type = InferredType::Unknown;
     LocalAttr* attr = nullptr;
@@ -28,11 +35,12 @@ struct VarBinding {
 
 class TypeAnalyzer {
 public:
-    explicit TypeAnalyzer(RuntimeState& rt) : rt_(rt) {
-        pushScope();
-    }
+    explicit TypeAnalyzer(RuntimeState& rt) : rt_(rt) {}
 
     void run(Chunk& chunk) {
+        // Pass 0: Lexical symbol & upvalue resolution
+        resolveChunkSymbols(chunk);
+
         static constexpr const char* kCommonFields[] = {
             "x", "y", "z", "vx", "vy", "vz", "mass", "next", "prev", "left", "right", "val", "key"
         };
@@ -43,6 +51,7 @@ public:
 
         // Pre-scan for `setmetatable`, stdlib aliases, and table nil/truthiness checks
         prescanStmts(chunk.body);
+        resolveFactoryClosures();
 
         // Pass 1: collect functions, intern strings, infer local/expr types, and gather call-site arg types
         in_pass1_ = true;
@@ -51,10 +60,10 @@ public:
         }
         // Propagate parameter types and table element types down call chains while in_pass1_ is active
         for (int iter = 0; iter < 2; ++iter) {
-            for (const auto& name : function_order_) {
-                auto it = functions_.find(name);
+            for (const auto& fkey : function_order_) {
+                auto it = functions_.find(fkey);
                 if (it != functions_.end()) {
-                    analyzeFuncBody(name, *it->second, false);
+                    analyzeFuncBody(fkey, *it->second, false);
                 }
             }
         }
@@ -63,26 +72,24 @@ public:
         in_pass1_ = false;
         field_types_.clear();
         table_elem_types_.clear();
-        scopes_.clear();
-        pushScope();
+        locals_.clear();
         for (auto& stmt : chunk.body) {
             analyzeStmt(*stmt);
         }
-        for (const auto& name : function_order_) {
-            auto it = functions_.find(name);
+        for (const auto& fkey : function_order_) {
+            auto it = functions_.find(fkey);
             if (it != functions_.end()) {
-                finalizeFuncBody(name, *it->second);
+                finalizeFuncBody(fkey, *it->second);
             }
         }
-        scopes_.clear();
-        pushScope();
+        locals_.clear();
         for (auto& stmt : chunk.body) {
             analyzeStmt(*stmt);
         }
-        for (const auto& name : function_order_) {
-            auto it = functions_.find(name);
+        for (const auto& fkey : function_order_) {
+            auto it = functions_.find(fkey);
             if (it != functions_.end()) {
-                finalizeFuncBody(name, *it->second);
+                finalizeFuncBody(fkey, *it->second);
             }
         }
     }
@@ -93,17 +100,17 @@ private:
             [&](const auto& e) {
                 using T = std::decay_t<decltype(e)>;
                 if constexpr (std::is_same_v<T, IdentExpr>) {
-                    if (e.name == "setmetatable") {
+                    if (e.symbol_id == 0 && e.name == "setmetatable") {
                         uses_metatables_ = true;
                     }
                     // Named other than as a call's callee: the value may be
                     // called from anywhere.
-                    value_refs_.insert(e.name);
+                    value_refs_.insert(varKey(e.symbol_id, e.name));
                 } else if constexpr (std::is_same_v<T, UnaryExpr>) {
                     if (e.op == UnOp::Not) {
                         if (const auto* idx = std::get_if<IndexExpr>(&e.operand->node)) {
                             if (const auto* base = std::get_if<IdentExpr>(&idx->table->node)) {
-                                nil_checked_tables_.insert(base->name);
+                                nil_checked_tables_.insert(varKey(base->symbol_id, base->name));
                             }
                         }
                     }
@@ -115,14 +122,14 @@ private:
                         if (rhs_nil) {
                             if (const auto* idx = std::get_if<IndexExpr>(&e.lhs->node)) {
                                 if (const auto* base = std::get_if<IdentExpr>(&idx->table->node)) {
-                                    nil_checked_tables_.insert(base->name);
+                                    nil_checked_tables_.insert(varKey(base->symbol_id, base->name));
                                 }
                             }
                         }
                         if (lhs_nil) {
                             if (const auto* idx = std::get_if<IndexExpr>(&e.rhs->node)) {
                                 if (const auto* base = std::get_if<IdentExpr>(&idx->table->node)) {
-                                    nil_checked_tables_.insert(base->name);
+                                    nil_checked_tables_.insert(varKey(base->symbol_id, base->name));
                                 }
                             }
                         }
@@ -141,7 +148,10 @@ private:
                     prescanExpr(*e.table);
                 } else if constexpr (std::is_same_v<T, CallExpr>) {
                     if (const auto* callee = std::get_if<IdentExpr>(&e.callee->node)) {
-                        if (callee->name == "setmetatable") uses_metatables_ = true;
+                        if (callee->symbol_id == 0 && callee->name == "setmetatable") {
+                            uses_metatables_ = true;
+                        }
+                        ++total_calls_[varKey(callee->symbol_id, callee->name)];
                     } else {
                         prescanExpr(*e.callee);
                     }
@@ -164,15 +174,25 @@ private:
                     if constexpr (std::is_same_v<T, LocalStmt>) {
                         for (const auto& ie : s.init) prescanExpr(*ie);
                         for (size_t i = 0; i < s.vars.size() && i < s.init.size(); ++i) {
-                            if (std::holds_alternative<FuncExpr>(s.init[i]->node)) {
-                                ++function_defs_[s.vars[i].name];
+                            std::string vkey = varKey(s.vars[i].symbol_id, s.vars[i].name);
+                            if (auto* fexpr = std::get_if<FuncExpr>(&s.init[i]->node)) {
+                                ++function_defs_[vkey];
+                                if (FuncBody* ret_fn = singleReturnedClosure(fexpr->func)) {
+                                    factory_closure_[vkey] = ret_fn;
+                                }
+                            } else if (const auto* cexpr = std::get_if<CallExpr>(&s.init[i]->node)) {
+                                if (const auto* cid = std::get_if<IdentExpr>(&cexpr->callee->node)) {
+                                    std::string ckey = varKey(cid->symbol_id, cid->name);
+                                    ++local_init_calls_[ckey];
+                                    local_init_from_call_[vkey] = ckey;
+                                    ++function_defs_[vkey];
+                                }
                             }
-                        }
-                        for (size_t i = 0; i < s.vars.size() && i < s.init.size(); ++i) {
                             if (const auto* fe = std::get_if<FieldExpr>(&s.init[i]->node)) {
                                 if (const auto* base = std::get_if<IdentExpr>(&fe->table->node)) {
-                                    if (base->name == "math" || base->name == "bit" || base->name == "bit32") {
-                                        stdlib_aliases_[s.vars[i].name] = {base->name, fe->field};
+                                    if (base->symbol_id == 0 &&
+                                        (base->name == "math" || base->name == "bit" || base->name == "bit32")) {
+                                        stdlib_aliases_[vkey] = {base->name, fe->field};
                                     }
                                 }
                             }
@@ -181,7 +201,7 @@ private:
                         for (const auto& te : s.targets) {
                             prescanExpr(*te);
                             if (const auto* id = std::get_if<IdentExpr>(&te->node)) {
-                                mutated_vars_.insert(id->name);
+                                mutated_vars_.insert(varKey(id->symbol_id, id->name));
                             }
                         }
                         for (const auto& ve : s.values) prescanExpr(*ve);
@@ -193,7 +213,7 @@ private:
                         for (const auto& br : s.branches) {
                             if (const auto* idx = std::get_if<IndexExpr>(&br.condition->node)) {
                                 if (const auto* base = std::get_if<IdentExpr>(&idx->table->node)) {
-                                    nil_checked_tables_.insert(base->name);
+                                    nil_checked_tables_.insert(varKey(base->symbol_id, base->name));
                                 }
                             }
                             prescanExpr(*br.condition);
@@ -216,7 +236,13 @@ private:
                         prescanStmts(s.body);
                     } else if constexpr (std::is_same_v<T, FuncDefStmt>) {
                         if (s.path.size() == 1 && s.method.empty()) {
-                            ++function_defs_[s.path[0]];
+                            std::string fkey = varKey(s.root_symbol_id, s.path[0]);
+                            ++function_defs_[fkey];
+                            if (FuncBody* ret_fn = singleReturnedClosure(s.func)) {
+                                factory_closure_[fkey] = ret_fn;
+                            }
+                        } else if (!s.path.empty() && s.method.empty() && s.path.size() == 1) {
+                            mutated_vars_.insert(varKey(s.root_symbol_id, s.path[0]));
                         }
                         prescanStmts(s.func.body);
                     } else if constexpr (std::is_same_v<T, ReturnStmt>) {
@@ -227,39 +253,28 @@ private:
         }
     }
 
-    void pushScope() {
-        scopes_.emplace_back();
-    }
-
-    void popScope() {
-        if (scopes_.size() > 1) {
-            scopes_.pop_back();
-        }
-    }
-
-    VarBinding* findVar(const std::string& name) {
-        for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-            auto found = it->find(name);
-            if (found != it->end()) {
-                return &found->second;
-            }
-        }
-        return nullptr;
-    }
-
-    void defineVar(const std::string& name, InferredType t, LocalAttr* attr = nullptr) {
+    void defineVar(uint32_t symbol_id, const std::string& name, InferredType t, LocalAttr* attr = nullptr) {
         if (attr) {
             attr->inferred_type = t;
         }
-        scopes_.back()[name] = VarBinding{t, attr};
+        if (symbol_id != 0) {
+            locals_[symbol_id] = VarBinding{t, attr};
+        } else {
+            globals_[name] = t;
+        }
     }
 
-    void updateVar(const std::string& name, InferredType t) {
-        if (auto* b = findVar(name)) {
-            b->type = joinTypes(b->type, t);
-            if (b->attr) {
-                b->attr->inferred_type = b->type;
+    void updateVar(uint32_t symbol_id, const std::string& name, InferredType t) {
+        if (symbol_id != 0) {
+            auto it = locals_.find(symbol_id);
+            if (it != locals_.end()) {
+                it->second.type = joinTypes(it->second.type, t);
+                if (it->second.attr) {
+                    it->second.attr->inferred_type = it->second.type;
+                }
+                return;
             }
+            locals_[symbol_id] = VarBinding{t, nullptr};
             return;
         }
         auto it = globals_.find(name);
@@ -270,12 +285,13 @@ private:
         }
     }
 
-    InferredType lookupVarType(const std::string& name) const {
-        for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-            auto found = it->find(name);
-            if (found != it->end()) {
-                return found->second.type;
+    InferredType lookupVarType(uint32_t symbol_id, const std::string& name) const {
+        if (symbol_id != 0) {
+            auto it = locals_.find(symbol_id);
+            if (it != locals_.end()) {
+                return it->second.type;
             }
+            return InferredType::Any;
         }
         auto git = globals_.find(name);
         if (git != globals_.end()) {
@@ -294,35 +310,44 @@ private:
         }
     }
 
-    void recordTableElemType(const std::string& tbl_var, InferredType t) {
+    void recordTableElemType(const std::string& tbl_key, InferredType t) {
         if (t == InferredType::Unknown) return;
-        auto it = table_elem_types_.find(tbl_var);
+        auto it = table_elem_types_.find(tbl_key);
         if (it == table_elem_types_.end()) {
-            table_elem_types_[tbl_var] = t;
+            table_elem_types_[tbl_key] = t;
         } else {
             it->second = joinTypes(it->second, t);
         }
     }
 
     void analyzeBlock(std::vector<StmtPtr>& stmts) {
-        pushScope();
         for (auto& s : stmts) {
             analyzeStmt(*s);
         }
-        popScope();
     }
 
-    void analyzeFuncBody(const std::string& func_name, FuncBody& fn, bool has_implicit_self = false) {
+    void analyzeFuncBody(const std::string& func_key, FuncBody& fn, bool has_implicit_self = false) {
+        if (!fn.captured_vars.empty()) {
+            size_t write = 0;
+            for (size_t i = 0; i < fn.captured_vars.size(); ++i) {
+                std::string k = varKey(fn.captured_vars[i].symbol_id, fn.captured_vars[i].name);
+                if (stdlib_aliases_.count(k) && value_refs_.count(k) == 0 && mutated_vars_.count(k) == 0) {
+                    continue;
+                }
+                if (write != i) fn.captured_vars[write] = fn.captured_vars[i];
+                ++write;
+            }
+            fn.captured_vars.resize(write);
+        }
         size_t total_params = fn.params.size() + (has_implicit_self ? 1 : 0);
         if (fn.param_types.size() < total_params) {
             fn.param_types.resize(total_params, InferredType::Unknown);
         }
-        if (!func_name.empty() && !callSitesKnown(func_name)) {
+        if (!func_key.empty() && !callSitesKnown(func_key)) {
             for (auto& pt : fn.param_types) pt = InferredType::Any;
         }
-        pushScope();
         if (has_implicit_self) {
-            defineVar("self", InferredType::Table);
+            defineVar(fn.self_symbol_id, "self", InferredType::Table);
         }
         for (size_t i = 0; i < fn.params.size(); ++i) {
             size_t type_idx = i + (has_implicit_self ? 1 : 0);
@@ -330,13 +355,14 @@ private:
             if (!in_pass1_ && pt == InferredType::Unknown) {
                 pt = InferredType::Any;
             }
-            defineVar(fn.params[i], pt);
+            uint32_t psym = i < fn.param_symbol_ids.size() ? fn.param_symbol_ids[i] : 0;
+            defineVar(psym, fn.params[i], pt);
         }
 
-        std::string prev_func_name = current_func_name_;
+        std::string prev_func_key = current_func_key_;
         InferredType prev_ret = current_return_type_;
         bool prev_saw_ret = saw_return_;
-        current_func_name_ = func_name;
+        current_func_key_ = func_key;
         current_return_type_ = InferredType::Unknown;
         saw_return_ = false;
 
@@ -350,15 +376,14 @@ private:
             fn.return_type = InferredType::Nil;
         }
 
-        current_func_name_ = prev_func_name;
+        current_func_key_ = prev_func_key;
         current_return_type_ = prev_ret;
         saw_return_ = prev_saw_ret;
-        popScope();
     }
 
-    void finalizeFuncBody(const std::string& name, FuncBody& fn) {
+    void finalizeFuncBody(const std::string& fkey, FuncBody& fn) {
         fn.return_type = InferredType::Unknown;
-        analyzeFuncBody(name, fn, false);
+        analyzeFuncBody(fkey, fn, false);
         bool all_params_num = !fn.params.empty();
         for (size_t i = 0; i < fn.params.size(); ++i) {
             if (i >= fn.param_types.size() || !isNumeric(fn.param_types[i])) {
@@ -366,7 +391,8 @@ private:
                 break;
             }
         }
-        fn.can_unbox = !fn.is_vararg && all_params_num && isNumeric(fn.return_type);
+        fn.can_unbox = !fn.is_vararg && all_params_num && isNumeric(fn.return_type) &&
+                       (fkey.empty() || callSitesKnown(fkey));
     }
 
     void analyzeStmt(Stmt& stmt) {
@@ -379,14 +405,27 @@ private:
                     }
                     for (size_t i = 0; i < s.vars.size(); ++i) {
                         rt_.internString(s.vars[i].name);
+                        std::string vkey = varKey(s.vars[i].symbol_id, s.vars[i].name);
+                        if (stdlib_aliases_.count(vkey) && value_refs_.count(vkey) == 0 &&
+                            mutated_vars_.count(vkey) == 0) {
+                            s.vars[i].is_captured = false;
+                        }
                         InferredType t = InferredType::Unknown;
                         if (i < s.init.size()) {
                             t = s.init[i]->inferred_type;
                             if (auto* fe = std::get_if<FuncExpr>(&s.init[i]->node)) {
-                                if (functions_.find(s.vars[i].name) == functions_.end()) {
-                                    function_order_.push_back(s.vars[i].name);
+                                if (functions_.find(vkey) == functions_.end()) {
+                                    function_order_.push_back(vkey);
                                 }
-                                functions_[s.vars[i].name] = &fe->func;
+                                functions_[vkey] = &fe->func;
+                            } else if (auto fbit = factory_bound_vars_.find(vkey); fbit != factory_bound_vars_.end()) {
+                                FuncBody* ret_fn = fbit->second;
+                                std::string akey = anonFuncKey(ret_fn);
+                                if (functions_.find(akey) == functions_.end()) {
+                                    function_order_.push_back(akey);
+                                    functions_[akey] = ret_fn;
+                                }
+                                functions_[vkey] = ret_fn;
                             } else if (const auto* te = std::get_if<TableExpr>(&s.init[i]->node)) {
                                 InferredType seq_t = InferredType::Unknown;
                                 for (const auto& f : te->fields) {
@@ -395,12 +434,12 @@ private:
                                     }
                                 }
                                 if (seq_t != InferredType::Unknown) {
-                                    recordTableElemType(s.vars[i].name, seq_t);
+                                    recordTableElemType(vkey, seq_t);
                                 }
                             } else if (const auto* src_id = std::get_if<IdentExpr>(&s.init[i]->node)) {
-                                auto tit = table_elem_types_.find(src_id->name);
+                                auto tit = table_elem_types_.find(varKey(src_id->symbol_id, src_id->name));
                                 if (tit != table_elem_types_.end()) {
-                                    recordTableElemType(s.vars[i].name, tit->second);
+                                    recordTableElemType(vkey, tit->second);
                                 }
                             }
                         } else if (!s.init.empty() &&
@@ -409,7 +448,7 @@ private:
                                     std::holds_alternative<VarargExpr>(s.init.back()->node))) {
                             t = InferredType::Any;
                         }
-                        defineVar(s.vars[i].name, t, &s.vars[i]);
+                        defineVar(s.vars[i].symbol_id, s.vars[i].name, t, &s.vars[i]);
                     }
                 } else if constexpr (std::is_same_v<T, AssignStmt>) {
                     for (auto& val : s.values) {
@@ -420,8 +459,8 @@ private:
                         InferredType rhs_t =
                             i < s.values.size() ? s.values[i]->inferred_type : InferredType::Any;
                         if (auto* id = std::get_if<IdentExpr>(&s.targets[i]->node)) {
-                            updateVar(id->name, rhs_t);
-                            s.targets[i]->inferred_type = lookupVarType(id->name);
+                            updateVar(id->symbol_id, id->name, rhs_t);
+                            s.targets[i]->inferred_type = lookupVarType(id->symbol_id, id->name);
                         } else if (auto* fld = std::get_if<FieldExpr>(&s.targets[i]->node)) {
                             recordFieldType(fld->field, rhs_t);
                             if (!uses_metatables_) {
@@ -432,9 +471,10 @@ private:
                             }
                         } else if (auto* idx = std::get_if<IndexExpr>(&s.targets[i]->node)) {
                             if (const auto* base = std::get_if<IdentExpr>(&idx->table->node)) {
-                                recordTableElemType(base->name, rhs_t);
+                                std::string bkey = varKey(base->symbol_id, base->name);
+                                recordTableElemType(bkey, rhs_t);
                                 if (!uses_metatables_) {
-                                    auto tit = table_elem_types_.find(base->name);
+                                    auto tit = table_elem_types_.find(bkey);
                                     if (tit != table_elem_types_.end() &&
                                         (isNumeric(tit->second) || tit->second == InferredType::Table)) {
                                         s.targets[i]->inferred_type = tit->second;
@@ -459,12 +499,10 @@ private:
                     analyzeExpr(*s.condition);
                     analyzeBlock(s.body);
                 } else if constexpr (std::is_same_v<T, RepeatStmt>) {
-                    pushScope();
                     for (auto& body_stmt : s.body) {
                         analyzeStmt(*body_stmt);
                     }
                     analyzeExpr(*s.until_cond);
-                    popScope();
                 } else if constexpr (std::is_same_v<T, NumericForStmt>) {
                     rt_.internString(s.var_name);
                     analyzeExpr(*s.start);
@@ -477,30 +515,27 @@ private:
                     bool step_int = !s.step || s.step->inferred_type == InferredType::Int64;
                     s.is_int_loop = start_int && stop_int && step_int;
 
-                    pushScope();
                     InferredType loop_var_t = s.is_int_loop
                         ? InferredType::Int64
                         : ((in_pass1_ && start_int && step_int && s.stop->inferred_type == InferredType::Unknown)
                                ? InferredType::Unknown
                                : InferredType::Number);
-                    defineVar(s.var_name, loop_var_t);
+                    defineVar(s.var_symbol_id, s.var_name, loop_var_t);
                     for (auto& body_stmt : s.body) {
                         analyzeStmt(*body_stmt);
                     }
-                    popScope();
                 } else if constexpr (std::is_same_v<T, GenericForStmt>) {
                     for (auto& ie : s.iter_exprs) {
                         analyzeExpr(*ie);
                     }
-                    pushScope();
-                    for (auto& vn : s.var_names) {
-                        rt_.internString(vn);
-                        defineVar(vn, InferredType::Any);
+                    for (size_t i = 0; i < s.var_names.size(); ++i) {
+                        rt_.internString(s.var_names[i]);
+                        uint32_t vsym = i < s.var_symbol_ids.size() ? s.var_symbol_ids[i] : 0;
+                        defineVar(vsym, s.var_names[i], InferredType::Any);
                     }
                     for (auto& body_stmt : s.body) {
                         analyzeStmt(*body_stmt);
                     }
-                    popScope();
                 } else if constexpr (std::is_same_v<T, FuncDefStmt>) {
                     for (const auto& part : s.path) {
                         rt_.internString(part);
@@ -512,20 +547,20 @@ private:
                         uint32_t fid = rt_.internString(s.path.back());
                         rt_.getOrAssignFieldSlot(fid);
                     }
-                    std::string fname;
+                    std::string fkey;
                     if (s.path.size() == 1 && s.method.empty()) {
-                        fname = s.path[0];
+                        fkey = varKey(s.root_symbol_id, s.path[0]);
                         if (s.is_local) {
-                            defineVar(fname, InferredType::Function);
+                            defineVar(s.root_symbol_id, s.path[0], InferredType::Function);
                         } else {
-                            updateVar(fname, InferredType::Function);
+                            updateVar(s.root_symbol_id, s.path[0], InferredType::Function);
                         }
-                        if (functions_.find(fname) == functions_.end()) {
-                            function_order_.push_back(fname);
+                        if (functions_.find(fkey) == functions_.end()) {
+                            function_order_.push_back(fkey);
                         }
-                        functions_[fname] = &s.func;
+                        functions_[fkey] = &s.func;
                     }
-                    analyzeFuncBody(fname, s.func, !s.method.empty());
+                    analyzeFuncBody(fkey, s.func, !s.method.empty());
                 } else if constexpr (std::is_same_v<T, ReturnStmt>) {
                     saw_return_ = true;
                     for (auto& v : s.values) {
@@ -546,29 +581,33 @@ private:
 
     InferredType inferStdlibCallType(const Expr& callee) const {
         if (const auto* id = std::get_if<IdentExpr>(&callee.node)) {
-            if (id->name == "tonumber") return InferredType::Number;
-            if (id->name == "tostring" || id->name == "type") return InferredType::String;
+            if (id->symbol_id == 0) {
+                if (id->name == "tonumber") return InferredType::Number;
+                if (id->name == "tostring" || id->name == "type") return InferredType::String;
+            }
         } else if (const auto* fe = std::get_if<FieldExpr>(&callee.node)) {
             if (const auto* base = std::get_if<IdentExpr>(&fe->table->node)) {
-                if (base->name == "math") {
-                    if (fe->field == "type") return InferredType::String;
-                    if (fe->field == "ult") return InferredType::Bool;
-                    return InferredType::Number;
-                }
-                if (base->name == "bit" || base->name == "bit32") {
-                    if (fe->field == "tohex") return InferredType::String;
-                    return InferredType::Int64;
-                }
-                if (base->name == "string") {
-                    if (fe->field == "len" || fe->field == "byte") return InferredType::Int64;
-                    if (fe->field == "sub" || fe->field == "format" || fe->field == "char" ||
-                        fe->field == "lower" || fe->field == "upper" || fe->field == "rep" ||
-                        fe->field == "reverse") {
-                        return InferredType::String;
+                if (base->symbol_id == 0) {
+                    if (base->name == "math") {
+                        if (fe->field == "type") return InferredType::String;
+                        if (fe->field == "ult") return InferredType::Bool;
+                        return InferredType::Number;
                     }
-                }
-                if (base->name == "os" && fe->field == "clock") {
-                    return InferredType::Float64;
+                    if (base->name == "bit" || base->name == "bit32") {
+                        if (fe->field == "tohex") return InferredType::String;
+                        return InferredType::Int64;
+                    }
+                    if (base->name == "string") {
+                        if (fe->field == "len" || fe->field == "byte") return InferredType::Int64;
+                        if (fe->field == "sub" || fe->field == "format" || fe->field == "char" ||
+                            fe->field == "lower" || fe->field == "upper" || fe->field == "rep" ||
+                            fe->field == "reverse") {
+                            return InferredType::String;
+                        }
+                    }
+                    if (base->name == "os" && fe->field == "clock") {
+                        return InferredType::Float64;
+                    }
                 }
             }
         }
@@ -594,7 +633,7 @@ private:
                     return InferredType::Any;
                 } else if constexpr (std::is_same_v<T, IdentExpr>) {
                     e.intern_id = rt_.internString(e.name);
-                    return lookupVarType(e.name);
+                    return lookupVarType(e.symbol_id, e.name);
                 } else if constexpr (std::is_same_v<T, UnaryExpr>) {
                     analyzeExpr(*e.operand);
                     switch (e.op) {
@@ -696,8 +735,9 @@ private:
                     analyzeExpr(*e.index);
                     if (!uses_metatables_) {
                         if (const auto* base = std::get_if<IdentExpr>(&e.table->node)) {
-                            if (nil_checked_tables_.count(base->name) == 0) {
-                                auto it = table_elem_types_.find(base->name);
+                            std::string bkey = varKey(base->symbol_id, base->name);
+                            if (nil_checked_tables_.count(bkey) == 0) {
+                                auto it = table_elem_types_.find(bkey);
                                 if (it != table_elem_types_.end() &&
                                     (isNumeric(it->second) || it->second == InferredType::Table)) {
                                     return it->second;
@@ -720,11 +760,12 @@ private:
                 } else if constexpr (std::is_same_v<T, CallExpr>) {
                     // Rewrite unmutated stdlib alias calls (`local bxor = bit.bxor`, `local sqrt = math.sqrt`)
                     if (const auto* id = std::get_if<IdentExpr>(&e.callee->node)) {
-                        if (mutated_vars_.count(id->name) == 0) {
-                            auto ait = stdlib_aliases_.find(id->name);
+                        std::string ckey = varKey(id->symbol_id, id->name);
+                        if (mutated_vars_.count(ckey) == 0) {
+                            auto ait = stdlib_aliases_.find(ckey);
                             if (ait != stdlib_aliases_.end()) {
                                 auto base_expr = std::make_unique<Expr>(
-                                    IdentExpr{ait->second.first, rt_.internString(ait->second.first)},
+                                    IdentExpr{ait->second.first, rt_.internString(ait->second.first), 0},
                                     e.callee->loc);
                                 FieldExpr fe;
                                 fe.table = std::move(base_expr);
@@ -744,24 +785,28 @@ private:
                         return std_t;
                     }
                     if (const auto* id = std::get_if<IdentExpr>(&e.callee->node)) {
-                        auto fit = functions_.find(id->name);
+                        std::string ckey = varKey(id->symbol_id, id->name);
+                        auto fit = functions_.find(ckey);
                         if (fit != functions_.end()) {
                             FuncBody* target = fit->second;
                             if (target->param_types.size() < target->params.size()) {
                                 target->param_types.resize(target->params.size(),
                                                            InferredType::Unknown);
                             }
-                            bool is_self_call = (id->name == current_func_name_);
-                            if ((!in_pass1_ || !is_self_call) && callSitesKnown(id->name)) {
+                            bool is_self_call = (ckey == current_func_key_);
+                            if ((!in_pass1_ || !is_self_call) && callSitesKnown(ckey)) {
                                 for (size_t i = 0; i < target->params.size(); ++i) {
                                     InferredType arg_t =
                                         i < e.args.size() ? e.args[i]->inferred_type : InferredType::Nil;
                                     target->param_types[i] = joinTypes(target->param_types[i], arg_t);
                                     if (i < e.args.size()) {
                                         if (const auto* arg_id = std::get_if<IdentExpr>(&e.args[i]->node)) {
-                                            auto tit = table_elem_types_.find(arg_id->name);
+                                            auto tit = table_elem_types_.find(varKey(arg_id->symbol_id, arg_id->name));
                                             if (tit != table_elem_types_.end()) {
-                                                recordTableElemType(target->params[i], tit->second);
+                                                uint32_t psym = i < target->param_symbol_ids.size()
+                                                                    ? target->param_symbol_ids[i]
+                                                                    : 0;
+                                                recordTableElemType(varKey(psym, target->params[i]), tit->second);
                                             }
                                         }
                                     }
@@ -785,34 +830,117 @@ private:
                     }
                     return InferredType::Any;
                 } else if constexpr (std::is_same_v<T, FuncExpr>) {
-                    analyzeFuncBody("", e.func, false);
+                    analyzeFuncBody(anonFuncKey(&e.func), e.func, false);
                     return InferredType::Function;
                 }
             },
             expr.node);
     }
 
+    static std::string anonFuncKey(const FuncBody* fn) {
+        return "@anon_" + std::to_string(reinterpret_cast<uintptr_t>(fn));
+    }
+
+    static bool stmtHasReturn(const Stmt& stmt) {
+        if (std::holds_alternative<ReturnStmt>(stmt.node)) return true;
+        if (const auto* bs = std::get_if<BlockStmt>(&stmt.node)) {
+            return stmtsHaveReturn(bs->body);
+        } else if (const auto* ifs = std::get_if<IfStmt>(&stmt.node)) {
+            for (const auto& br : ifs->branches) {
+                if (stmtsHaveReturn(br.body)) return true;
+            }
+            return stmtsHaveReturn(ifs->else_body);
+        } else if (const auto* ws = std::get_if<WhileStmt>(&stmt.node)) {
+            return stmtsHaveReturn(ws->body);
+        } else if (const auto* rs = std::get_if<RepeatStmt>(&stmt.node)) {
+            return stmtsHaveReturn(rs->body);
+        } else if (const auto* nfs = std::get_if<NumericForStmt>(&stmt.node)) {
+            return stmtsHaveReturn(nfs->body);
+        } else if (const auto* gfs = std::get_if<GenericForStmt>(&stmt.node)) {
+            return stmtsHaveReturn(gfs->body);
+        }
+        return false;
+    }
+
+    static bool stmtsHaveReturn(const std::vector<StmtPtr>& stmts) {
+        for (const auto& sp : stmts) {
+            if (stmtHasReturn(*sp)) return true;
+        }
+        return false;
+    }
+
+    static FuncBody* singleReturnedClosure(const FuncBody& fn) {
+        if (fn.body.empty()) return nullptr;
+        for (size_t i = 0; i + 1 < fn.body.size(); ++i) {
+            if (stmtHasReturn(*fn.body[i])) return nullptr;
+        }
+        const auto* ret = std::get_if<ReturnStmt>(&fn.body.back()->node);
+        if (!ret || ret->values.size() != 1) return nullptr;
+        auto* fe = std::get_if<FuncExpr>(&ret->values[0]->node);
+        return fe ? const_cast<FuncBody*>(&fe->func) : nullptr;
+    }
+
+    void resolveFactoryClosures() {
+        for (const auto& [fkey, ret_fn] : factory_closure_) {
+            if (!varCallSitesKnown(fkey)) continue;
+            int tot = total_calls_[fkey];
+            int loc = local_init_calls_[fkey];
+            bool all_known = (tot > 0 && tot == loc);
+            for (const auto& [vkey, callee_key] : local_init_from_call_) {
+                if (callee_key == fkey) {
+                    if (varCallSitesKnown(vkey)) {
+                        factory_bound_vars_[vkey] = ret_fn;
+                    } else {
+                        all_known = false;
+                    }
+                }
+            }
+            anon_call_sites_known_[anonFuncKey(ret_fn)] = all_known;
+        }
+    }
+
     RuntimeState& rt_;
     bool in_pass1_ = true;
     bool uses_metatables_ = false;
-    std::string current_func_name_;
-    std::vector<std::unordered_map<std::string, VarBinding>> scopes_;
+    std::string current_func_key_;
+    std::unordered_map<uint32_t, VarBinding> locals_;
     std::unordered_map<std::string, InferredType> globals_;
     std::vector<std::string> function_order_;
     std::unordered_map<std::string, FuncBody*> functions_;
     std::unordered_map<std::string, std::pair<std::string, std::string>> stdlib_aliases_;
     std::unordered_set<std::string> mutated_vars_;
+    std::unordered_map<std::string, FuncBody*> factory_closure_;
+    std::unordered_map<std::string, int> total_calls_;
+    std::unordered_map<std::string, int> local_init_calls_;
+    std::unordered_map<std::string, std::string> local_init_from_call_;
+    std::unordered_map<std::string, FuncBody*> factory_bound_vars_;
+    std::unordered_map<std::string, bool> anon_call_sites_known_;
     // A function's parameter types are the join of its direct calls' argument
-    // types only when those are all its calls: its name is never used as a
+    // types only when those are all its calls: its variable is never used as a
     // value (`local g = f`, an argument, a table item), never assigned, and
-    // names one function. Names are not scoped here, so any use of the name
-    // counts.
+    // names one function. Keys are scoped by lexical symbol_id (`#id` for
+    // locals, `name` for globals).
     std::unordered_set<std::string> value_refs_;
     std::unordered_map<std::string, int> function_defs_;
-    bool callSitesKnown(const std::string& name) const {
-        auto it = function_defs_.find(name);
-        return value_refs_.count(name) == 0 && mutated_vars_.count(name) == 0 &&
+    bool varCallSitesKnown(const std::string& fkey) const {
+        auto it = function_defs_.find(fkey);
+        return value_refs_.count(fkey) == 0 && mutated_vars_.count(fkey) == 0 &&
                (it == function_defs_.end() || it->second <= 1);
+    }
+    bool callSitesKnown(const std::string& fkey) const {
+        auto ait = anon_call_sites_known_.find(fkey);
+        if (ait != anon_call_sites_known_.end()) {
+            return ait->second;
+        }
+        if (fkey.rfind("@anon_", 0) == 0) {
+            return false;
+        }
+        auto fbit = factory_bound_vars_.find(fkey);
+        if (fbit != factory_bound_vars_.end()) {
+            auto ak = anon_call_sites_known_.find(anonFuncKey(fbit->second));
+            return ak != anon_call_sites_known_.end() && ak->second && varCallSitesKnown(fkey);
+        }
+        return varCallSitesKnown(fkey);
     }
     std::unordered_set<std::string> nil_checked_tables_;
     std::unordered_map<std::string, InferredType> field_types_;

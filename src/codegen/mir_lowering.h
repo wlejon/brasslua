@@ -51,7 +51,7 @@ struct CompiledFuncSig {
     std::vector<Rep> param_reps;
     Rep return_rep = Rep::Boxed;
     uint32_t arity = 0;
-    std::vector<std::string> captured_names;
+    std::vector<CapturedVar> captured_vars;
     const FuncBody* fbody = nullptr;
 };
 
@@ -68,13 +68,15 @@ struct FunctionBuildState {
     brass::Value* closure_arg = nullptr;
     brass::Value* args_ptr_arg = nullptr;
     brass::Value* nargs_arg = nullptr;
-    brass::Value* args_scratch = nullptr; // alloca(128) for call args
+    brass::Value* args_scratch = nullptr; // alloca(128) for scratch use
 
-    std::vector<std::unordered_map<std::string, LocalVarInfo>> scopes;
+    std::vector<std::unordered_map<uint32_t, LocalVarInfo>> scopes;
     std::vector<LoopContext> loops;
     std::unordered_map<std::string, brass::BasicBlock*> label_blocks;
     std::vector<brass::Value*> close_vars;
     std::string self_func_name;
+    uint32_t self_func_symbol_id = 0;
+    uint32_t vararg_offset = 0;
 
     explicit FunctionBuildState(brass::Function& f) : fn(&f), builder(f) {}
 
@@ -128,6 +130,9 @@ public:
     // Representation helpers
     static Rep repForInferredType(InferredType t) noexcept;
     static brass::Type mirTypeForRep(Rep r) noexcept;
+    static std::string varKey(uint32_t symbol_id, const std::string& name) {
+        return symbol_id != 0 ? ("#" + std::to_string(symbol_id)) : name;
+    }
 
     brass::Value* emitBox(FunctionBuildState& st, MirValue v);
     brass::Value* emitUnboxInt64(FunctionBuildState& st, MirValue v);
@@ -135,14 +140,14 @@ public:
     MirValue coerceToRep(FunctionBuildState& st, MirValue v, Rep target);
     brass::Value* emitTruthinessBit(FunctionBuildState& st, MirValue v);
 
-    // Scope & variable helpers
+    // Scope & variable helpers (keyed by lexical symbol_id; symbol_id == 0 is global)
     void pushScope(FunctionBuildState& st);
     void popScope(FunctionBuildState& st);
-    LocalVarInfo* lookupLocal(FunctionBuildState& st, const std::string& name);
-    LocalVarInfo defineLocal(FunctionBuildState& st, const std::string& name, Rep rep,
+    LocalVarInfo* lookupLocal(FunctionBuildState& st, uint32_t symbol_id);
+    LocalVarInfo defineLocal(FunctionBuildState& st, uint32_t symbol_id, Rep rep,
                              bool as_upvalue = false, bool is_close = false);
-    MirValue loadVar(FunctionBuildState& st, const std::string& name, uint32_t intern_id);
-    void storeVar(FunctionBuildState& st, const std::string& name, uint32_t intern_id, MirValue val);
+    MirValue loadVar(FunctionBuildState& st, uint32_t symbol_id, const std::string& name, uint32_t intern_id);
+    void storeVar(FunctionBuildState& st, uint32_t symbol_id, const std::string& name, uint32_t intern_id, MirValue val);
 
     // Statement & expression lowering
     void lowerStmt(FunctionBuildState& st, const Stmt& stmt);
@@ -168,15 +173,15 @@ public:
 
     // Function lowering
     CompiledFuncSig compileFuncBody(FunctionBuildState* parent_st, const std::string& debug_name,
-                                    const FuncBody& fbody, bool has_implicit_self);
+                                    uint32_t func_symbol_id, const FuncBody& fbody, bool has_implicit_self);
 
     RuntimeState& rt() noexcept { return rt_; }
     brass::Module& mod() noexcept { return mod_; }
     const std::unordered_map<std::string, CompiledFuncSig>& knownFunctions() const noexcept {
         return known_functions_;
     }
-    void registerKnownFunction(const std::string& name, const CompiledFuncSig& sig) {
-        known_functions_[name] = sig;
+    void registerKnownFunction(const std::string& key, const CompiledFuncSig& sig) {
+        known_functions_[key] = sig;
     }
 
 private:

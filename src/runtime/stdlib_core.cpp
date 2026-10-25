@@ -61,17 +61,25 @@ void coroutineEntry(void* arg) {
     auto* ctx = static_cast<CoroutineContext*>(arg);
     auto& rt = RuntimeState::current();
     try {
-        std::vector<uint64_t> init_args = std::move(ctx->transfer_vals);
-        ctx->transfer_vals.clear();
-        uint64_t r0 = brasslua_rt_call(
-            Value::fromFunction(ctx->coroutine()->entry_closure).rawBits(),
-            init_args.data(),
-            static_cast<int64_t>(init_args.size()));
-        const auto& mret = rt.multiRetVec();
-        if (!mret.empty()) {
-            ctx->transfer_vals = mret;
+        uint64_t stack_args[8];
+        std::vector<uint64_t> heap_args;
+        size_t n = ctx->transfer_vals.size();
+        uint64_t* init_ptr = stack_args;
+        if (n > 8) {
+            heap_args.assign(ctx->transfer_vals.begin(), ctx->transfer_vals.end());
+            init_ptr = heap_args.data();
         } else {
-            ctx->transfer_vals = {r0};
+            for (size_t i = 0; i < n; ++i) stack_args[i] = ctx->transfer_vals[i];
+        }
+        ctx->transfer_vals.clear();
+        (void)brasslua_rt_call(
+            Value::fromFunction(ctx->coroutine()->entry_closure).rawBits(),
+            init_ptr,
+            static_cast<int64_t>(n));
+        size_t rcount = rt.multiRetCount();
+        ctx->transfer_vals.resize(rcount);
+        for (size_t i = 0; i < rcount; ++i) {
+            ctx->transfer_vals[i] = rt.getMultiRet(i);
         }
     } catch (const CoroutineUnwind&) {
         ctx->transfer_vals.clear();
@@ -105,14 +113,18 @@ CoroutineContext* contextOf(RuntimeState& rt, LuaCoroutine* co) {
 // Runs `co` on its fiber until it yields, returns, errs or (closing) unwinds;
 // `vals` go across as the resume's arguments. Returns with the coroutine's
 // status and the running coroutine set back for the resumer.
-void runCoroutine(RuntimeState& rt, Value co_val, CoroutineContext* ctx, std::vector<uint64_t> vals) {
+void runCoroutine(RuntimeState& rt, Value co_val, CoroutineContext* ctx, const uint64_t* vals, size_t nvals) {
     auto* co = static_cast<LuaCoroutine*>(co_val.asPointer());
     ctx->self = co_val;
     if (!ctx->fiber) {
         ctx->fiber = brass::gc::Fiber::create(&coroutineEntry, ctx, CoroutineContext::kStackBytes);
         if (!ctx->fiber) throw LuaRuntimeError("cannot create a coroutine stack");
     }
-    ctx->transfer_vals = std::move(vals);
+    if (vals && nvals > 0) {
+        ctx->transfer_vals.assign(vals, vals + nvals);
+    } else {
+        ctx->transfer_vals.clear();
+    }
 
     LuaCoroutine* prev = getRunningCoroutine(rt);
     if (prev) prev->status = CoroutineStatus::Normal;
@@ -144,6 +156,7 @@ uint64_t luaPrint(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     }
     out.push_back('\n');
     rt.writeOutput(out);
+    rt.setMultiRet(nullptr, 0);
     return kNilBits;
 }
 
@@ -255,17 +268,13 @@ uint64_t luaPcall(void* /*cl*/, const uint64_t* args, int64_t nargs) {
         return returnMulti(rt, {Value::fromBool(false).rawBits(), rt.makeStringValue("value expected")});
     }
     try {
-        uint64_t r0 = brasslua_rt_call(args[0], nargs > 1 ? args + 1 : nullptr, nargs - 1);
+        (void)brasslua_rt_call(args[0], nargs > 1 ? args + 1 : nullptr, nargs - 1);
         std::vector<uint64_t> ret;
         size_t mcount = rt.multiRetCount();
         ret.reserve(mcount + 1);
         ret.push_back(Value::fromBool(true).rawBits());
-        if (mcount > 0) {
-            for (size_t i = 0; i < mcount; ++i) {
-                ret.push_back(rt.getMultiRet(i));
-            }
-        } else {
-            ret.push_back(r0);
+        for (size_t i = 0; i < mcount; ++i) {
+            ret.push_back(rt.getMultiRet(i));
         }
         return returnMulti(rt, ret);
     } catch (const LuaRuntimeError& e) {
@@ -284,17 +293,13 @@ uint64_t luaXpcall(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     uint64_t fn = args[0];
     uint64_t msgh = args[1];
     try {
-        uint64_t r0 = brasslua_rt_call(fn, nargs > 2 ? args + 2 : nullptr, nargs - 2);
+        (void)brasslua_rt_call(fn, nargs > 2 ? args + 2 : nullptr, nargs - 2);
         std::vector<uint64_t> ret;
         size_t mcount = rt.multiRetCount();
         ret.reserve(mcount + 1);
         ret.push_back(Value::fromBool(true).rawBits());
-        if (mcount > 0) {
-            for (size_t i = 0; i < mcount; ++i) {
-                ret.push_back(rt.getMultiRet(i));
-            }
-        } else {
-            ret.push_back(r0);
+        for (size_t i = 0; i < mcount; ++i) {
+            ret.push_back(rt.getMultiRet(i));
         }
         return returnMulti(rt, ret);
     } catch (const LuaRuntimeError& e) {
@@ -410,12 +415,15 @@ uint64_t luaGetmetatable(void* /*cl*/, const uint64_t* args, int64_t nargs) {
         mt = getStringMetatable(rt);
     }
     if (!mt) return kNilBits;
-    uint32_t mm_id = rt.internString("__metatable");
-    uint64_t protected_mt = brasslua_rt_rawget(
-        Value::fromTable(mt).rawBits(),
-        Value::fromString(rt.getLuaStringById(mm_id)).rawBits());
-    if (!Value(protected_mt).isNil()) {
-        return protected_mt;
+    uint32_t mt_flags = getOrComputeMetatableFlags(rt, mt);
+    if ((mt_flags & kMetaProtected) != 0) {
+        uint32_t mm_id = rt.internString("__metatable");
+        uint64_t protected_mt = brasslua_rt_rawget(
+            Value::fromTable(mt).rawBits(),
+            Value::fromString(rt.getLuaStringById(mm_id)).rawBits());
+        if (!Value(protected_mt).isNil()) {
+            return protected_mt;
+        }
     }
     return Value::fromTable(mt).rawBits();
 }
@@ -427,11 +435,8 @@ uint64_t luaSetmetatable(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     auto& rt = RuntimeState::current();
     auto* tbl = static_cast<LuaTable*>(Value(args[0]).asPointer());
     if (tbl->metatable) {
-        uint32_t mm_id = rt.internString("__metatable");
-        uint64_t protected_mt = brasslua_rt_rawget(
-            Value::fromTable(tbl->metatable).rawBits(),
-            Value::fromString(rt.getLuaStringById(mm_id)).rawBits());
-        if (!Value(protected_mt).isNil()) {
+        uint32_t old_flags = getOrComputeMetatableFlags(rt, tbl->metatable);
+        if ((old_flags & kMetaProtected) != 0) {
             throw LuaRuntimeError("cannot change a protected metatable");
         }
     }
@@ -440,9 +445,14 @@ uint64_t luaSetmetatable(void* /*cl*/, const uint64_t* args, int64_t nargs) {
         tbl->metatable = nullptr;
         tbl->flags = 0;
     } else if (mt_val.isTable()) {
-        tbl->metatable = static_cast<LuaTable*>(mt_val.asPointer());
-        recomputeMetatableFlags(rt, tbl);
-        rt.heap().remember(reinterpret_cast<uintptr_t>(tbl));
+        auto* mt = static_cast<LuaTable*>(mt_val.asPointer());
+        tbl->metatable = mt;
+        uint32_t mt_flags = getOrComputeMetatableFlags(rt, mt);
+        tbl->flags = (tbl->flags & kMetaGcArmed) | (mt_flags & kMetaTableFlagsMask);
+        if ((mt_flags & kMetaGc) != 0) {
+            armTableFinalizerIfNeeded(rt, tbl);
+        }
+        rt.heap().write_barrier(reinterpret_cast<uintptr_t>(tbl), args[1]);
     } else {
         throw LuaRuntimeError("bad argument #2 to 'setmetatable' (nil or table expected)");
     }
@@ -526,6 +536,7 @@ uint64_t luaLoadChunkRunner(void* cl_ptr, const uint64_t* /*args*/, int64_t /*na
         for (const Value& v : res.return_values) rbits.push_back(v.rawBits());
         return returnMulti(rt, rbits);
     }
+    rt.setMultiRet(nullptr, 0);
     return res.return_value.rawBits();
 }
 
@@ -572,6 +583,7 @@ uint64_t luaDofile(void* /*cl*/, const uint64_t* args, int64_t nargs) {
         for (const Value& v : res.return_values) rbits.push_back(v.rawBits());
         return returnMulti(rt, rbits);
     }
+    rt.setMultiRet(nullptr, 0);
     return res.return_value.rawBits();
 }
 
@@ -632,7 +644,8 @@ uint64_t luaCoroResume(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     }
 
     CoroutineContext* ctx = contextOf(rt, co);
-    runCoroutine(rt, Value(args[0]), ctx, std::vector<uint64_t>(args + 1, args + nargs));
+    runCoroutine(rt, Value(args[0]), ctx, nargs > 1 ? (args + 1) : nullptr,
+                 nargs > 1 ? static_cast<size_t>(nargs - 1) : 0);
 
     if (ctx->error_occurred) {
         ctx->error_occurred = false;
@@ -640,8 +653,19 @@ uint64_t luaCoroResume(void* /*cl*/, const uint64_t* args, int64_t nargs) {
         ctx->error_val = Value::nil();
         return returnMulti(rt, {Value::fromBool(false).rawBits(), err_bits});
     }
+    size_t tsize = ctx->transfer_vals.size();
+    if (tsize <= 7) {
+        uint64_t stack_ret[8];
+        stack_ret[0] = Value::fromBool(true).rawBits();
+        for (size_t i = 0; i < tsize; ++i) {
+            stack_ret[i + 1] = ctx->transfer_vals[i];
+        }
+        ctx->transfer_vals.clear();
+        rt.setMultiRet(stack_ret, tsize + 1);
+        return stack_ret[0];
+    }
     std::vector<uint64_t> ret;
-    ret.reserve(ctx->transfer_vals.size() + 1);
+    ret.reserve(tsize + 1);
     ret.push_back(Value::fromBool(true).rawBits());
     ret.insert(ret.end(), ctx->transfer_vals.begin(), ctx->transfer_vals.end());
     ctx->transfer_vals.clear();
@@ -655,13 +679,19 @@ uint64_t luaCoroYield(void* /*cl*/, const uint64_t* args, int64_t nargs) {
         throw LuaRuntimeError("attempt to yield from outside a coroutine");
     }
     auto* ctx = static_cast<CoroutineContext*>(co->ctx_state);
-    ctx->transfer_vals.assign(args, args + nargs);
+    if (args && nargs > 0) {
+        ctx->transfer_vals.assign(args, args + nargs);
+    } else {
+        ctx->transfer_vals.clear();
+    }
     co->status = CoroutineStatus::Suspended;
     brass::gc::Fiber::suspend();
     if (ctx->closing) throw CoroutineUnwind{};
-    std::vector<uint64_t> resumed = std::move(ctx->transfer_vals);
+    size_t rsize = ctx->transfer_vals.size();
+    uint64_t r0 = rsize > 0 ? ctx->transfer_vals[0] : kNilBits;
+    rt.setMultiRet(ctx->transfer_vals.data(), rsize);
     ctx->transfer_vals.clear();
-    return returnMulti(rt, resumed);
+    return r0;
 }
 
 uint64_t luaCoroWrapCaller(void* cl_ptr, const uint64_t* args, int64_t nargs) {
@@ -669,19 +699,27 @@ uint64_t luaCoroWrapCaller(void* cl_ptr, const uint64_t* args, int64_t nargs) {
     auto* cl = static_cast<LuaClosure*>(cl_ptr);
     if (!cl || cl->upvalue_count < 1 || !cl->upvalues[0]) return kNilBits;
     uint64_t co_bits = cl->upvalues[0]->value;
-    std::vector<uint64_t> call_args;
-    call_args.reserve(static_cast<size_t>(nargs) + 1);
-    call_args.push_back(co_bits);
-    for (int64_t i = 0; i < nargs; ++i) call_args.push_back(args[i]);
-    luaCoroResume(nullptr, call_args.data(), static_cast<int64_t>(call_args.size()));
-    const auto& mret = rt.multiRetVec();
-    if (mret.empty() || !Value(mret[0]).isTruthy()) {
-        std::string msg = mret.size() >= 2 ? valueToStdString(rt, Value(mret[1])) : "coroutine error";
-        Value ev = mret.size() >= 2 ? Value(mret[1]) : Value::nil();
+    if (!Value(co_bits).isCoroutine()) {
+        throw LuaRuntimeError("bad argument #1 to 'coroutine.resume' (thread expected)");
+    }
+    auto* co = static_cast<LuaCoroutine*>(Value(co_bits).asPointer());
+    if (co->status != CoroutineStatus::Suspended) {
+        throw LuaRuntimeError("cannot resume non-suspended coroutine");
+    }
+    CoroutineContext* ctx = contextOf(rt, co);
+    runCoroutine(rt, Value(co_bits), ctx, args, nargs > 0 ? static_cast<size_t>(nargs) : 0);
+    if (ctx->error_occurred) {
+        ctx->error_occurred = false;
+        Value ev = ctx->error_val;
+        ctx->error_val = Value::nil();
+        std::string msg = !ev.isNil() ? valueToStdString(rt, ev) : ctx->error_msg;
         throw LuaRuntimeError(msg, ev);
     }
-    std::vector<uint64_t> unwrapped(mret.begin() + 1, mret.end());
-    return returnMulti(rt, unwrapped);
+    size_t tsize = ctx->transfer_vals.size();
+    uint64_t r0 = tsize > 0 ? ctx->transfer_vals[0] : kNilBits;
+    rt.setMultiRet(ctx->transfer_vals.data(), tsize);
+    ctx->transfer_vals.clear();
+    return r0;
 }
 
 uint64_t luaCoroWrap(void* /*cl*/, const uint64_t* args, int64_t nargs) {
@@ -707,7 +745,7 @@ uint64_t luaCoroClose(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     auto* ctx = static_cast<CoroutineContext*>(co->ctx_state);
     if (ctx && ctx->fiber && ctx->fiber->started() && co->status == CoroutineStatus::Suspended) {
         ctx->closing = true;
-        runCoroutine(rt, Value(args[0]), ctx, {});
+        runCoroutine(rt, Value(args[0]), ctx, nullptr, 0);
         ctx->closing = false;
         co = ctx->coroutine();
     }
