@@ -10,20 +10,6 @@
 #include <string>
 #include <vector>
 
-#if defined(_MSC_VER) && defined(_M_X64)
-#include <intrin.h>
-#define BRASSLUA_CLEAR_WIN64_SHADOW() \
-    do { \
-        auto* _ret_slot = static_cast<volatile uint64_t*>(_AddressOfReturnAddress()); \
-        _ret_slot[1] = 0; \
-        _ret_slot[2] = 0; \
-        _ret_slot[3] = 0; \
-        _ret_slot[4] = 0; \
-    } while (0)
-#else
-#define BRASSLUA_CLEAR_WIN64_SHADOW() ((void)0)
-#endif
-
 namespace brasslua {
 
 namespace {
@@ -491,12 +477,10 @@ uint64_t brasslua_rt_rawget(uint64_t table, uint64_t key) {
 uint64_t brasslua_rt_rawset(uint64_t table, uint64_t key, uint64_t val) {
     Value tv(table);
     if (!tv.isTable()) {
-        BRASSLUA_CLEAR_WIN64_SHADOW();
         return table;
     }
     auto& rt = RuntimeState::current();
     rawTableSet(rt, static_cast<LuaTable*>(tv.asPointer()), key, val);
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     return table;
 }
 
@@ -549,12 +533,10 @@ uint64_t brasslua_rt_table_set(uint64_t table, uint64_t key, uint64_t val) {
         if (rt.hostBridge().isHostObject && rt.hostBridge().isHostObject(cur.rawBits())) {
             if (Value(key).isString() && rt.hostBridge().setProperty) {
                 rt.hostBridge().setProperty(cur.rawBits(), valueToStringView(rt, Value(key)), val);
-                BRASSLUA_CLEAR_WIN64_SHADOW();
                 return table;
             }
             if (rt.hostBridge().setIndex) {
                 rt.hostBridge().setIndex(cur.rawBits(), key, val);
-                BRASSLUA_CLEAR_WIN64_SHADOW();
                 return table;
             }
         }
@@ -567,7 +549,6 @@ uint64_t brasslua_rt_table_set(uint64_t table, uint64_t key, uint64_t val) {
                     if (!ni_mm.isNil()) {
                         if (ni_mm.isFunction()) {
                             brasslua_rt_call_3(ni_mm.rawBits(), cur.rawBits(), key, val);
-                            BRASSLUA_CLEAR_WIN64_SHADOW();
                             return table;
                         }
                         cur = ni_mm;
@@ -576,14 +557,12 @@ uint64_t brasslua_rt_table_set(uint64_t table, uint64_t key, uint64_t val) {
                 }
             }
             rawTableSet(rt, tbl, key, val);
-            BRASSLUA_CLEAR_WIN64_SHADOW();
             return table;
         }
         Value ni_mm = lookupMetamethod(rt, cur, "__newindex");
         if (!ni_mm.isNil()) {
             if (ni_mm.isFunction()) {
                 brasslua_rt_call_3(ni_mm.rawBits(), cur.rawBits(), key, val);
-                BRASSLUA_CLEAR_WIN64_SHADOW();
                 return table;
             }
             cur = ni_mm;
@@ -591,7 +570,6 @@ uint64_t brasslua_rt_table_set(uint64_t table, uint64_t key, uint64_t val) {
         }
         throw LuaRuntimeError("attempt to index a non-table value");
     }
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     return table;
 }
 
@@ -633,7 +611,6 @@ uint64_t brasslua_rt_table_set_int(uint64_t table, int64_t idx, uint64_t val) {
                     --tbl->array_len;
                 }
             }
-            BRASSLUA_CLEAR_WIN64_SHADOW();
             return table;
         }
     }
@@ -645,15 +622,16 @@ uint64_t brasslua_rt_table_get_field(uint64_t table, uint32_t intern_id, uint32_
     Value tv(table);
     if (tv.isTable()) {
         auto* tbl = static_cast<LuaTable*>(tv.asPointer());
+        uint64_t own = kNilBits;
         if (slot_hint < LuaTable::kInlineSlots) {
-            uint64_t v = tbl->slots[slot_hint];
-            if (!Value(v).isNil() || (tbl->flags & kMetaIndex) == 0) {
-                return v;
-            }
-        } else if ((tbl->flags & kMetaIndex) == 0) {
+            own = tbl->slots[slot_hint];
+        } else {
             LuaString* s = rt.getLuaStringById(intern_id);
             if (!s) return kNilBits;
-            return hashTableGet(tbl, Value::fromString(s).rawBits(), s->hash);
+            own = hashTableGet(tbl, Value::fromString(s).rawBits(), s->hash);
+        }
+        if (!Value(own).isNil() || (tbl->flags & kMetaIndex) == 0) {
+            return own;
         }
         // Fast single-hop metatable table __index (standard Lua OOP `Class.__index = Class`)
         if ((tbl->flags & kMetaIndex) != 0 && tbl->metatable) {
@@ -686,14 +664,12 @@ uint64_t brasslua_rt_table_set_field(uint64_t table, uint32_t intern_id, uint32_
         if ((tbl->flags & kMetaNewIndex) == 0 && slot_hint < LuaTable::kInlineSlots) {
             tbl->slots[slot_hint] = val;
             RuntimeState::current().heap().write_barrier(reinterpret_cast<uintptr_t>(tbl), val);
-            BRASSLUA_CLEAR_WIN64_SHADOW();
             return table;
         }
     }
     auto& rt = RuntimeState::current();
     LuaString* s = rt.getLuaStringById(intern_id);
     if (!s) {
-        BRASSLUA_CLEAR_WIN64_SHADOW();
         return table;
     }
     return brasslua_rt_table_set(table, Value::fromString(s).rawBits(), val);
@@ -705,7 +681,6 @@ uint64_t brasslua_rt_table_append_multiret(uint64_t table, int64_t start_idx) {
     for (size_t i = 0; i < mret.size(); ++i) {
         brasslua_rt_table_set_int(table, start_idx + static_cast<int64_t>(i), mret[i]);
     }
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     return table;
 }
 

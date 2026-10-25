@@ -301,6 +301,23 @@ int runRuntimeJitTests() {
                     "return a, f(), obj:m(..., f()), varargs, and nested >4-arg calls work");
     }
 
+    {
+        bool ok = false;
+        std::string out = runAndCapture(R"(
+            local M = {}
+            M.__index = M
+            function M:get() return self.v end
+            local o = setmetatable({ v = 99, w = 1 }, M)
+            print(o.v, o.w, o:get())
+            local p = setmetatable({}, { __index = { v = 7 } })
+            print(p.v)
+            p.v = 8
+            print(p.v)
+        )", ok);
+        EXPECT_TRUE(ok && out == "99\t1\t99\n7\n8\n",
+                    "a table with a table __index reads its own hash-part fields before __index");
+    }
+
     return failures;
 }
 

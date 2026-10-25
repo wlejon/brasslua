@@ -155,21 +155,6 @@ void brasslua_rt_close_local(uint64_t val) {
     brasslua_rt_call_2(mm.rawBits(), val, kNilBits);
 }
 
-#if defined(_MSC_VER) && defined(_M_X64)
-#include <intrin.h>
-#define BRASSLUA_CLEAR_WIN64_SHADOW()                                           \
-    do {                                                                        \
-        auto* _caller_slots = reinterpret_cast<volatile uint64_t*>(             \
-            static_cast<char*>(_AddressOfReturnAddress()) + 8);                 \
-        _caller_slots[0] = 0;                                                   \
-        _caller_slots[1] = 0;                                                   \
-        _caller_slots[2] = 0;                                                   \
-        _caller_slots[3] = 0;                                                   \
-    } while (0)
-#else
-#define BRASSLUA_CLEAR_WIN64_SHADOW() ((void)0)
-#endif
-
 #if defined(_MSC_VER)
 #define BRASSLUA_NOINLINE __declspec(noinline)
 #else
@@ -200,7 +185,6 @@ static BRASSLUA_NOINLINE uint64_t callNonFunctionSlow(
 }
 
 uint64_t brasslua_rt_call(uint64_t callee, const uint64_t* args, int64_t nargs) {
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     auto& rt = RuntimeState::current();
     Value cv(callee);
     if (cv.isFunction()) {
@@ -218,7 +202,6 @@ uint64_t brasslua_rt_call(uint64_t callee, const uint64_t* args, int64_t nargs) 
 }
 
 uint64_t brasslua_rt_call_0(uint64_t callee) {
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     auto& rt = RuntimeState::current();
     Value cv(callee);
     if (cv.isFunction()) {
@@ -236,7 +219,6 @@ uint64_t brasslua_rt_call_0(uint64_t callee) {
 }
 
 uint64_t brasslua_rt_call_1(uint64_t callee, uint64_t a0) {
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     auto& rt = RuntimeState::current();
     Value cv(callee);
     if (cv.isFunction()) {
@@ -254,7 +236,6 @@ uint64_t brasslua_rt_call_1(uint64_t callee, uint64_t a0) {
 }
 
 uint64_t brasslua_rt_call_2(uint64_t callee, uint64_t a0, uint64_t a1) {
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     uint64_t args[2] = {a0, a1};
     auto& rt = RuntimeState::current();
     Value cv(callee);
@@ -273,7 +254,6 @@ uint64_t brasslua_rt_call_2(uint64_t callee, uint64_t a0, uint64_t a1) {
 }
 
 uint64_t brasslua_rt_call_3(uint64_t callee, uint64_t a0, uint64_t a1, uint64_t a2) {
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     uint64_t args[3] = {a0, a1, a2};
     auto& rt = RuntimeState::current();
     Value cv(callee);
@@ -292,7 +272,6 @@ uint64_t brasslua_rt_call_3(uint64_t callee, uint64_t a0, uint64_t a1, uint64_t 
 }
 
 uint64_t brasslua_rt_call_4(uint64_t callee, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     uint64_t args[4] = {a0, a1, a2, a3};
     auto& rt = RuntimeState::current();
     Value cv(callee);
@@ -311,7 +290,6 @@ uint64_t brasslua_rt_call_4(uint64_t callee, uint64_t a0, uint64_t a1, uint64_t 
 }
 
 uint64_t brasslua_rt_call_multiret(uint64_t callee, const uint64_t* prefix_args, int64_t prefix_count) {
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     auto& rt = RuntimeState::current();
     const auto& tail = rt.multiRetVec();
     size_t pcount = prefix_count > 0 ? static_cast<size_t>(prefix_count) : 0;
@@ -334,7 +312,6 @@ uint64_t brasslua_rt_call_multiret(uint64_t callee, const uint64_t* prefix_args,
 
 uint64_t brasslua_rt_call_method(uint64_t obj, uint32_t method_intern_id, uint32_t slot_hint,
                                  const uint64_t* args, int64_t nargs) {
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     auto& rt = RuntimeState::current();
     // Rule 6: When calling a method on a host object (`obj:m(x)`), pass `obj` as the
     // explicit receiver (`this`) and `(x)` as the arguments!
@@ -372,7 +349,6 @@ uint64_t brasslua_rt_call_method(uint64_t obj, uint32_t method_intern_id, uint32
 
 uint64_t brasslua_rt_call_method_multiret(uint64_t obj, uint32_t method_intern_id, uint32_t slot_hint,
                                           const uint64_t* prefix_args, int64_t prefix_count) {
-    BRASSLUA_CLEAR_WIN64_SHADOW();
     auto& rt = RuntimeState::current();
     std::vector<uint64_t> tail = rt.multiRetVec();
     size_t pcount = prefix_count > 0 ? static_cast<size_t>(prefix_count) : 0;
