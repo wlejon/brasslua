@@ -84,6 +84,13 @@ double   brasslua_rt_pow_f64(double a, double b);
 int64_t  brasslua_rt_idiv_i64(int64_t a, int64_t b);
 int64_t  brasslua_rt_mod_i64(int64_t a, int64_t b);
 
+// ---- Numeric for ----
+// forprep (lvm.c): 0 skips the loop, 1 is an integer loop and 2 a float one,
+// out[0..2] then the initial value, limit and step as int64_t or double bits.
+// An integer loop's limit is clipped to the integers (forlimit). Raises Lua's
+// errors for a zero step or a value that is not a number.
+int64_t  brasslua_rt_forprep(uint64_t init, uint64_t limit, uint64_t step, uint64_t* out);
+
 #ifdef __cplusplus
 }
 #endif

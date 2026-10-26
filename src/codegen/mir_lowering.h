@@ -159,6 +159,7 @@ public:
     // Statement & expression lowering
     void lowerStmt(FunctionBuildState& st, const Stmt& stmt);
     void lowerBlockStmts(FunctionBuildState& st, const std::vector<StmtPtr>& stmts);
+    void lowerNumericFor(FunctionBuildState& st, const NumericForStmt& s); // mir_lowering_for.cpp
     MirValue lowerExpr(FunctionBuildState& st, const Expr& expr);
     // lowerExpr for a call or `...` whose values are then read from the
     // multiret buffer (the last of a call's arguments or a table's items, the
@@ -191,6 +192,8 @@ public:
                         bool through_index, bool nil_is_hit,
                         brass::BasicBlock* hit_bb, brass::BasicBlock* miss_bb);
     brass::Value* emitFieldGet(FunctionBuildState& st, brass::Value* obj_bits, uint32_t intern_id);
+    // The env table (_G) as a constant of the code.
+    brass::Value* emitEnvConst(FunctionBuildState& st);
     void emitFieldSet(FunctionBuildState& st, brass::Value* obj_bits, uint32_t intern_id, brass::Value* val_bits);
 
     // Function lowering

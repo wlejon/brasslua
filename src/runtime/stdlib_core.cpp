@@ -291,23 +291,22 @@ uint64_t luaXpcall(void* /*cl*/, const uint64_t* args, int64_t nargs) {
 }
 
 uint64_t luaSelect(void* /*cl*/, const uint64_t* args, int64_t nargs) {
+    // luaB_select.
     auto& rt = RuntimeState::current();
-    if (nargs < 1) return kNilBits;
-    Value first(args[0]);
-    if (first.isString() && valueToStringView(rt, first) == "#") {
-        return Value::fromInt64(nargs - 1).rawBits();
+    const Args a(args, nargs, "select");
+    const Value first = a.at(1);
+    if (first.isString()) {
+        const std::string_view s = valueToStringView(rt, first);
+        if (!s.empty() && s[0] == '#') return Value::fromInt64(nargs - 1).rawBits();
     }
-    int64_t idx = first.asInt64();
-    int64_t total = nargs - 1;
-    if (idx < 0) {
-        idx = total + idx + 1;
+    int64_t i = a.checkInteger(1);
+    if (i < 0) {
+        i = nargs + i;
+    } else if (i > nargs) {
+        i = nargs;
     }
-    if (idx < 1) idx = 1;
-    std::vector<uint64_t> ret;
-    for (int64_t i = idx; i <= total; ++i) {
-        ret.push_back(args[i]);
-    }
-    return returnMulti(rt, ret);
+    if (i < 1) a.error(1, "index out of range");
+    return returnValues(rt, args + i, static_cast<size_t>(nargs - i));
 }
 
 uint64_t luaRawget(void* /*cl*/, const uint64_t* args, int64_t nargs) {
@@ -472,51 +471,43 @@ uint64_t luaCollectgarbage(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     return Value::fromInt64(0).rawBits();
 }
 
-uint64_t luaLoadChunkRunner(void* cl_ptr, const uint64_t* /*args*/, int64_t /*nargs*/) {
-    auto& rt = RuntimeState::current();
-    auto* cl = static_cast<LuaClosure*>(cl_ptr);
-    if (!cl || cl->upvalue_count < 1 || !cl->upvalues[0]) return kNilBits;
-    Value code_val(cl->upvalues[0]->value);
-    std::string_view src = valueToStringView(rt, code_val);
-    ExecutionResult res = evalLuaSource(src);
-    if (!res.success) {
-        throw LuaRuntimeError(res.error_message);
-    }
-    if (!res.return_values.empty()) {
-        std::vector<uint64_t> rbits;
-        rbits.reserve(res.return_values.size());
-        for (const Value& v : res.return_values) rbits.push_back(v.rawBits());
-        return returnMulti(rt, rbits);
-    }
-    rt.setMultiRet(nullptr, 0);
-    return res.return_value.rawBits();
-}
-
+// luaB_load: a string chunk (a number is one too) named by itself unless
+// named, or the pieces a reader function returns until nil or "", named
+// "=(load)". Compiled once, to the chunk's main function; a chunk that does
+// not compile gives nil and the message.
 uint64_t luaLoad(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     auto& rt = RuntimeState::current();
-    if (nargs < 1) return returnMulti(rt, {kNilBits, rt.makeStringValue("expected string or function")});
+    const Args a(args, nargs, "load");
+    const Value chunk = a.at(1);
     std::string code;
-    if (Value(args[0]).isString()) {
-        code = std::string(valueToStringView(rt, Value(args[0])));
-    } else if (Value(args[0]).isFunction()) {
+    std::string name;
+    char numbuf[kNumberBufSize];
+    if (chunk.isString() || chunk.isNumeric()) {
+        code = std::string(a.checkString(1, numbuf));
+        name = std::string(a.optString(2, numbuf, code));
+    } else {
+        if (!chunk.isFunction()) a.typeError(1, "function");
+        name = std::string(a.optString(2, numbuf, "=(load)"));
         for (;;) {
-            uint64_t piece = brasslua_rt_call_0(args[0]);
-            if (Value(piece).isNil()) break;
-            std::string_view sv = valueToStringView(rt, Value(piece));
+            const Value piece(brasslua_rt_call_0(chunk.rawBits()));
+            if (piece.isNil()) break;
+            if (!piece.isString()) {
+                return returnMulti(rt, {kNilBits, rt.makeStringValue("reader function must return a string")});
+            }
+            std::string_view sv = valueToStringView(rt, piece);
             if (sv.empty()) break;
             code.append(sv);
         }
-    } else {
-        return returnMulti(rt, {kNilBits, rt.makeStringValue("expected string or reader function")});
     }
+    LuaNativeFn entry = nullptr;
     try {
-        (void)parseLuaSource(code, "=load");
+        ExecutionOptions opts;
+        opts.source_name = name;
+        entry = compileLuaChunk(code, opts);
     } catch (const std::exception& e) {
         return returnMulti(rt, {kNilBits, rt.makeStringValue(e.what())});
     }
-    LuaClosure* runner = rt.allocClosure(&luaLoadChunkRunner, nullptr, 1, 0);
-    runner->upvalues[0]->value = rt.makeStringValue(code);
-    return Value::fromFunction(runner).rawBits();
+    return Value::fromFunction(rt.allocClosure(entry, nullptr, 0, 0)).rawBits();
 }
 
 uint64_t luaDofile(void* /*cl*/, const uint64_t* args, int64_t nargs) {
@@ -541,6 +532,12 @@ uint64_t luaDofile(void* /*cl*/, const uint64_t* args, int64_t nargs) {
 
 // ---- Coroutine Library ----
 
+// auxresume's refusal of a coroutine that is not suspended.
+const char* resumeRefusal(const LuaCoroutine* co) noexcept {
+    return co->status == CoroutineStatus::Dead ? "cannot resume dead coroutine"
+                                               : "cannot resume non-suspended coroutine";
+}
+
 uint64_t luaCoroCreate(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     if (nargs < 1 || !Value(args[0]).isFunction()) {
         throw LuaRuntimeError("bad argument #1 to 'coroutine.create' (function expected)");
@@ -557,6 +554,7 @@ uint64_t luaCoroStatus(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     }
     auto& rt = RuntimeState::current();
     auto* co = static_cast<LuaCoroutine*>(Value(args[0]).asPointer());
+    if (co == getMainThread(rt) && getRunningCoroutine(rt)) return rt.makeStringValue("normal");
     switch (co->status) {
         case CoroutineStatus::Suspended: return rt.makeStringValue("suspended");
         case CoroutineStatus::Running:   return rt.makeStringValue("running");
@@ -570,7 +568,7 @@ uint64_t luaCoroRunning(void* /*cl*/, const uint64_t* /*args*/, int64_t /*nargs*
     auto& rt = RuntimeState::current();
     LuaCoroutine* running = getRunningCoroutine(rt);
     if (!running) {
-        return returnMulti(rt, {kNilBits, Value::fromBool(true).rawBits()});
+        return returnMulti(rt, {Value::fromCoroutine(getMainThread(rt)).rawBits(), Value::fromBool(true).rawBits()});
     }
     return returnMulti(rt, {Value::fromCoroutine(running).rawBits(), Value::fromBool(false).rawBits()});
 }
@@ -591,8 +589,7 @@ uint64_t luaCoroResume(void* /*cl*/, const uint64_t* args, int64_t nargs) {
     auto& rt = RuntimeState::current();
     auto* co = static_cast<LuaCoroutine*>(Value(args[0]).asPointer());
     if (co->status != CoroutineStatus::Suspended) {
-        return returnMulti(rt, {Value::fromBool(false).rawBits(),
-                                rt.makeStringValue("cannot resume non-suspended coroutine")});
+        return returnMulti(rt, {Value::fromBool(false).rawBits(), rt.makeStringValue(resumeRefusal(co))});
     }
 
     CoroutineContext* ctx = contextOf(rt, co);
@@ -656,7 +653,7 @@ uint64_t luaCoroWrapCaller(void* cl_ptr, const uint64_t* args, int64_t nargs) {
     }
     auto* co = static_cast<LuaCoroutine*>(Value(co_bits).asPointer());
     if (co->status != CoroutineStatus::Suspended) {
-        throw LuaRuntimeError("cannot resume non-suspended coroutine");
+        throw LuaRuntimeError(resumeRefusal(co));
     }
     CoroutineContext* ctx = contextOf(rt, co);
     runCoroutine(rt, Value(co_bits), ctx, args, nargs > 0 ? static_cast<size_t>(nargs) : 0);
@@ -739,7 +736,6 @@ void registerCoreStdlib(RuntimeState& rt) {
     rt.setGlobal("ipairs", makeNativeClosure(rt, &luaIpairs, 1));
     rt.setGlobal("collectgarbage", makeNativeClosure(rt, &luaCollectgarbage, 1));
     rt.setGlobal("load", makeNativeClosure(rt, &luaLoad, 1));
-    rt.setGlobal("loadstring", makeNativeClosure(rt, &luaLoad, 1));
     rt.setGlobal("dofile", makeNativeClosure(rt, &luaDofile, 1));
     rt.setGlobal("_VERSION", Value(rt.makeStringValue("Lua 5.4")));
     rt.setGlobal("_G", Value::fromTable(rt.envTable()));

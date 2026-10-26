@@ -63,11 +63,10 @@ public:
     // A new string of these bytes, not interned (internString interns one).
     LuaString* allocString(std::string_view str);
 
-    // Globals (_ENV)
+    // Globals: the fields of the env table (_G), raw, a missing one asked of
+    // the host bridge. Compiled code reads and writes them as fields.
     void setGlobal(std::string_view name, Value val);
-    void setGlobalById(uint32_t intern_id, Value val);
     Value getGlobal(std::string_view name);
-    Value getGlobalById(uint32_t intern_id);
     LuaTable* envTable() const noexcept;
 
     // Allocations on brass::gc::Heap
@@ -172,7 +171,12 @@ struct ExecutionResult {
     std::string error_message;
 };
 
-ExecutionResult evalLuaSource(std::string_view source, const ExecutionOptions& opts = {});
+// Compiles a chunk to its main function, a vararg Lua function whose `...`
+// are its arguments, its code loaded for the life of the thread. Throws the
+// syntax or compile error.
+LuaNativeFn compileLuaChunk(std::string_view source, const ExecutionOptions& opts = {});
+ExecutionResult evalLuaSource(std::string_view source, const ExecutionOptions& opts = {},
+                              const uint64_t* args = nullptr, size_t nargs = 0);
 ExecutionResult evalLuaFile(const std::string& path, const std::vector<std::string>& script_args = {},
                             const ExecutionOptions& opts = {});
 bool compileLuaToObjectFile(std::string_view source, const std::string& output_path,

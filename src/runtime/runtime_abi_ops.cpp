@@ -12,7 +12,11 @@
 namespace brasslua {
 namespace {
 
-uint64_t callBinaryMetamethod(RuntimeState& rt, uint64_t a, uint64_t b, std::string_view event, const char* op_desc) {
+enum class BinOpKind { Arith, Bitwise, Concat };
+[[noreturn]] void throwBinOpError(RuntimeState& rt, Value a, Value b, BinOpKind kind);
+
+// luaT_trybinTM: the metamethod of a, else b's, else the operator's error.
+uint64_t callBinaryMetamethod(RuntimeState& rt, uint64_t a, uint64_t b, std::string_view event, BinOpKind kind) {
     Value mm = lookupMetamethod(rt, Value(a), event);
     if (mm.isNil()) {
         mm = lookupMetamethod(rt, Value(b), event);
@@ -20,7 +24,7 @@ uint64_t callBinaryMetamethod(RuntimeState& rt, uint64_t a, uint64_t b, std::str
     if (!mm.isNil()) {
         return brasslua_rt_call_2(mm.rawBits(), a, b);
     }
-    throw LuaRuntimeError(std::string("attempt to ") + op_desc + " non-numeric values");
+    throwBinOpError(rt, Value(a), Value(b), kind);
 }
 
 // Exact mathematical comparison between int64_t i and double d (Lua 5.4 lvm.c)
@@ -80,6 +84,21 @@ std::string objTypeName(RuntimeState& rt, Value v) {
     return typeNameOf(v);
 }
 
+// luaG_opinterror / luaG_tointerror / luaG_concaterror: the operand blamed
+// is b when it is the wrong one, else a.
+void throwBinOpError(RuntimeState& rt, Value a, Value b, BinOpKind kind) {
+    switch (kind) {
+        case BinOpKind::Concat:
+            throwTypeError(rt, (a.isString() || a.isNumeric()) ? b : a, "concatenate");
+        case BinOpKind::Bitwise:
+            if (a.isNumeric() && b.isNumeric()) throw LuaRuntimeError("number has no integer representation");
+            throwTypeError(rt, b.isNumeric() ? a : b, "perform bitwise operation on");
+        case BinOpKind::Arith:
+            break;
+    }
+    throwTypeError(rt, b.isNumeric() ? a : b, "perform arithmetic on");
+}
+
 // luaG_ordererror.
 [[noreturn]] void throwOrderError(RuntimeState& rt, Value a, Value b) {
     const std::string t1 = objTypeName(rt, a);
@@ -99,19 +118,32 @@ int64_t wrapMul(int64_t x, int64_t y) noexcept {
 }
 
 } // namespace
+
+void throwTypeError(RuntimeState& rt, Value v, const char* op) {
+    throw LuaRuntimeError(std::string("attempt to ") + op + " a " + objTypeName(rt, v) + " value");
+}
+
 } // namespace brasslua
 
 extern "C" {
 
 using namespace brasslua;
 
+// A global the inline probe of the env table did not find (or a write it
+// could not make): the field of _G with its metamethods, a missing one asked
+// of the host.
 uint64_t brasslua_rt_get_global(uint32_t intern_id) {
-    return RuntimeState::current().getGlobalById(intern_id).rawBits();
+    auto& rt = RuntimeState::current();
+    uint64_t v = brasslua_rt_table_get(Value::fromTable(rt.envTable()).rawBits(),
+                                       Value::fromString(rt.getLuaStringById(intern_id)).rawBits());
+    if (Value(v).isNil() && rt.hostBridge().getGlobal) v = rt.hostBridge().getGlobal(rt.getStringById(intern_id));
+    return v;
 }
 
 void brasslua_rt_set_global(uint32_t intern_id, uint64_t val) {
     auto& rt = RuntimeState::current();
-    rt.setGlobalById(intern_id, Value(val));
+    brasslua_rt_table_set(Value::fromTable(rt.envTable()).rawBits(),
+                          Value::fromString(rt.getLuaStringById(intern_id)).rawBits(), val);
     if (rt.hostBridge().setGlobal) {
         rt.hostBridge().setGlobal(rt.getStringById(intern_id), val);
     }
@@ -126,7 +158,7 @@ uint64_t brasslua_rt_concat(uint64_t a, uint64_t b) {
         sa.append(sb);
         return rt.makeStringValue(sa);
     }
-    return callBinaryMetamethod(rt, a, b, "__concat", "concatenate");
+    return callBinaryMetamethod(rt, a, b, "__concat", BinOpKind::Concat);
 }
 
 int64_t brasslua_rt_obj_len(uint64_t v) {
@@ -150,7 +182,7 @@ int64_t brasslua_rt_obj_len(uint64_t v) {
         uint64_t res = brasslua_rt_call_1(mm.rawBits(), v);
         return Value(res).asInt64();
     }
-    throw LuaRuntimeError("attempt to get length of a non-string/table value");
+    throwTypeError(rt, val, "get length of");
 }
 
 uint64_t brasslua_rt_closure_new(void* fn_ptr, void* unboxed_ptr, uint32_t upval_count, uint32_t arity) {
@@ -233,7 +265,7 @@ static BRASSLUA_NOINLINE uint64_t callNonFunctionSlow(
         }
         return brasslua_rt_call(mm.rawBits(), full_args.data(), nargs + 1);
     }
-    throw LuaRuntimeError("attempt to call a non-function value");
+    throwTypeError(rt, Value(callee), "call");
 }
 
 uint64_t brasslua_rt_call(uint64_t callee, const uint64_t* args, int64_t nargs) {
@@ -466,6 +498,56 @@ int64_t brasslua_rt_idiv_i64(int64_t a, int64_t b) {
     return q;
 }
 
+int64_t brasslua_rt_forprep(uint64_t init_bits, uint64_t limit_bits, uint64_t step_bits, uint64_t* out) {
+    RuntimeState& rt = RuntimeState::current();
+    auto forError = [&](Value v, const char* what) {
+        throw LuaRuntimeError(std::string("bad 'for' ") + what + " (number expected, got " +
+                              objTypeName(rt, v) + ")");
+    };
+    const Value init(init_bits), limit(limit_bits), step(step_bits);
+    if (init.isInteger() && step.isInteger()) {
+        const int64_t i0 = init.asInt64();
+        const int64_t st = step.asInt64();
+        if (st == 0) throw LuaRuntimeError("'for' step is zero");
+        // forlimit: the limit as an integer, floored (or ceiled for a
+        // negative step); a float beyond the integers clips or skips.
+        Value lim;
+        if (!arithOperand(limit, lim)) forError(limit, "limit");
+        int64_t l = 0;
+        if (lim.isInteger()) {
+            l = lim.asInt64();
+        } else {
+            const double f = st < 0 ? std::ceil(lim.asDouble()) : std::floor(lim.asDouble());
+            if (f >= -9223372036854775808.0 && f < 9223372036854775808.0) {
+                l = static_cast<int64_t>(f);
+            } else if (f > 0) {
+                if (st < 0) return 0;
+                l = std::numeric_limits<int64_t>::max();
+            } else {
+                // NaN lands here too: it is not greater than 0.
+                if (st > 0) return 0;
+                l = std::numeric_limits<int64_t>::min();
+            }
+        }
+        if (st > 0 ? i0 > l : i0 < l) return 0;
+        out[0] = static_cast<uint64_t>(i0);
+        out[1] = static_cast<uint64_t>(l);
+        out[2] = static_cast<uint64_t>(st);
+        return 1;
+    }
+    Value nl, ns, ni;
+    if (!arithOperand(limit, nl)) forError(limit, "limit");
+    if (!arithOperand(step, ns)) forError(step, "step");
+    if (!arithOperand(init, ni)) forError(init, "initial value");
+    const double fl = asDouble(nl), fs = asDouble(ns), fi = asDouble(ni);
+    if (fs == 0) throw LuaRuntimeError("'for' step is zero");
+    if (0 < fs ? fl < fi : fi < fl) return 0;
+    std::memcpy(&out[0], &fi, 8);
+    std::memcpy(&out[1], &fl, 8);
+    std::memcpy(&out[2], &fs, 8);
+    return 2;
+}
+
 int64_t brasslua_rt_mod_i64(int64_t a, int64_t b) {
     if (b == 0) {
         throw LuaRuntimeError("attempt to perform 'n%0'");
@@ -489,7 +571,7 @@ uint64_t brasslua_rt_add(uint64_t a, uint64_t b) {
     }
     uint64_t r = 0;
     if (arith(a, b, wrapAdd, [](double x, double y) { return x + y; }, r)) return r;
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__add", "add");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__add", BinOpKind::Arith);
 }
 
 uint64_t brasslua_rt_sub(uint64_t a, uint64_t b) {
@@ -501,7 +583,7 @@ uint64_t brasslua_rt_sub(uint64_t a, uint64_t b) {
     }
     uint64_t r = 0;
     if (arith(a, b, wrapSub, [](double x, double y) { return x - y; }, r)) return r;
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__sub", "subtract");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__sub", BinOpKind::Arith);
 }
 
 uint64_t brasslua_rt_mul(uint64_t a, uint64_t b) {
@@ -513,7 +595,7 @@ uint64_t brasslua_rt_mul(uint64_t a, uint64_t b) {
     }
     uint64_t r = 0;
     if (arith(a, b, wrapMul, [](double x, double y) { return x * y; }, r)) return r;
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__mul", "multiply");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__mul", BinOpKind::Arith);
 }
 
 uint64_t brasslua_rt_div(uint64_t a, uint64_t b) {
@@ -521,7 +603,7 @@ uint64_t brasslua_rt_div(uint64_t a, uint64_t b) {
     if (tryCoerceToDouble(Value(a), da) && tryCoerceToDouble(Value(b), db)) {
         return Value::fromDouble(da / db).rawBits();
     }
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__div", "divide");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__div", BinOpKind::Arith);
 }
 
 uint64_t brasslua_rt_idiv(uint64_t a, uint64_t b) {
@@ -531,7 +613,7 @@ uint64_t brasslua_rt_idiv(uint64_t a, uint64_t b) {
     }
     uint64_t r = 0;
     if (arith(a, b, brasslua_rt_idiv_i64, [](double x, double y) { return std::floor(x / y); }, r)) return r;
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__idiv", "floor-divide");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__idiv", BinOpKind::Arith);
 }
 
 double brasslua_rt_fmod(double a, double b) {
@@ -549,7 +631,7 @@ uint64_t brasslua_rt_mod(uint64_t a, uint64_t b) {
     }
     uint64_t r = 0;
     if (arith(a, b, brasslua_rt_mod_i64, brasslua_rt_fmod, r)) return r;
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__mod", "modulo");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__mod", BinOpKind::Arith);
 }
 
 double brasslua_rt_pow_f64(double a, double b) {
@@ -561,7 +643,7 @@ uint64_t brasslua_rt_pow(uint64_t a, uint64_t b) {
     if (tryCoerceToDouble(Value(a), da) && tryCoerceToDouble(Value(b), db)) {
         return Value::fromDouble(std::pow(da, db)).rawBits();
     }
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__pow", "exponentiate");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__pow", BinOpKind::Arith);
 }
 
 uint64_t brasslua_rt_unm(uint64_t a) {
@@ -580,7 +662,7 @@ uint64_t brasslua_rt_unm(uint64_t a) {
     if (!mm.isNil()) {
         return brasslua_rt_call_1(mm.rawBits(), a);
     }
-    throw LuaRuntimeError("attempt to negate a non-numeric value");
+    throwBinOpError(rt, va, va, BinOpKind::Arith);
 }
 
 uint64_t brasslua_rt_band(uint64_t a, uint64_t b) {
@@ -588,7 +670,7 @@ uint64_t brasslua_rt_band(uint64_t a, uint64_t b) {
     if (tryCoerceToInt64(Value(a), ia) && tryCoerceToInt64(Value(b), ib)) {
         return Value::fromInt64(ia & ib).rawBits();
     }
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__band", "bitwise AND");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__band", BinOpKind::Bitwise);
 }
 
 uint64_t brasslua_rt_bor(uint64_t a, uint64_t b) {
@@ -596,7 +678,7 @@ uint64_t brasslua_rt_bor(uint64_t a, uint64_t b) {
     if (tryCoerceToInt64(Value(a), ia) && tryCoerceToInt64(Value(b), ib)) {
         return Value::fromInt64(ia | ib).rawBits();
     }
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__bor", "bitwise OR");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__bor", BinOpKind::Bitwise);
 }
 
 uint64_t brasslua_rt_bxor(uint64_t a, uint64_t b) {
@@ -604,7 +686,7 @@ uint64_t brasslua_rt_bxor(uint64_t a, uint64_t b) {
     if (tryCoerceToInt64(Value(a), ia) && tryCoerceToInt64(Value(b), ib)) {
         return Value::fromInt64(ia ^ ib).rawBits();
     }
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__bxor", "bitwise XOR");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__bxor", BinOpKind::Bitwise);
 }
 
 uint64_t brasslua_rt_bnot(uint64_t a) {
@@ -617,7 +699,7 @@ uint64_t brasslua_rt_bnot(uint64_t a) {
     if (!mm.isNil()) {
         return brasslua_rt_call_1(mm.rawBits(), a);
     }
-    throw LuaRuntimeError("number has no integer representation");
+    throwBinOpError(rt, Value(a), Value(a), BinOpKind::Bitwise);
 }
 
 static int64_t luaShiftLeft(int64_t x, int64_t y) noexcept {
@@ -635,7 +717,7 @@ uint64_t brasslua_rt_shl(uint64_t a, uint64_t b) {
     if (tryCoerceToInt64(Value(a), ia) && tryCoerceToInt64(Value(b), ib)) {
         return Value::fromInt64(luaShiftLeft(ia, ib)).rawBits();
     }
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__shl", "shift left");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__shl", BinOpKind::Bitwise);
 }
 
 uint64_t brasslua_rt_shr(uint64_t a, uint64_t b) {
@@ -644,7 +726,7 @@ uint64_t brasslua_rt_shr(uint64_t a, uint64_t b) {
         int64_t neg_b = (ib == std::numeric_limits<int64_t>::min()) ? 64 : -ib;
         return Value::fromInt64(luaShiftLeft(ia, neg_b)).rawBits();
     }
-    return callBinaryMetamethod(RuntimeState::current(), a, b, "__shr", "shift right");
+    return callBinaryMetamethod(RuntimeState::current(), a, b, "__shr", BinOpKind::Bitwise);
 }
 
 int32_t brasslua_rt_eq(uint64_t a, uint64_t b) {

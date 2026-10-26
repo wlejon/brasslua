@@ -94,48 +94,51 @@ void registerBrassLuaRuntimeSymbols(brass::codegen::JitExecutionEngine& engine) 
     reg("brasslua_rt_fmod", &brasslua_rt_fmod, Type::f64(), {Type::f64(), Type::f64()});
     reg("brasslua_rt_pow_f64", &brasslua_rt_pow_f64, Type::f64(), {Type::f64(), Type::f64()});
     reg("brasslua_rt_idiv_i64", &brasslua_rt_idiv_i64, Type::i64(), {Type::i64(), Type::i64()});
+    reg("brasslua_rt_forprep", &brasslua_rt_forprep, Type::i64(), {Type::i64(), Type::i64(), Type::i64(), Type::ptr()});
     reg("brasslua_rt_mod_i64", &brasslua_rt_mod_i64, Type::i64(), {Type::i64(), Type::i64()});
 }
 
-ExecutionResult evalLuaSource(std::string_view source, const ExecutionOptions& opts) {
+LuaNativeFn compileLuaChunk(std::string_view source, const ExecutionOptions& opts) {
+    auto& rt = RuntimeState::current();
+    Chunk chunk = parseLuaSource(source, opts.source_name);
+    analyzeAndInferTypes(chunk, rt);
+
+    brass::Module mod(opts.source_name);
+    MirModuleLowerer lowerer(rt, mod);
+    std::string entry_sym = lowerer.lowerChunk(chunk);
+
+    if (opts.optimize) {
+        brass::PassPipelineOptions popts = brass::production_pass_pipeline_options();
+        popts.enable_sroa = true;
+        brass::run_pass_pipeline(mod, popts);
+    }
+
+    if (opts.dump_mir) {
+        brass::print_module(mod, std::cerr);
+    }
+
+    auto engine = std::make_unique<brass::codegen::JitExecutionEngine>();
+    registerBrassLuaRuntimeSymbols(*engine);
+    if (!engine->compile_and_load(mod)) {
+        throw std::runtime_error("brass JIT compilation failed");
+    }
+    auto entry_fn = engine->get_function_ptr<LuaNativeFn>(entry_sym);
+    if (!entry_fn) {
+        throw std::runtime_error("entry symbol not found after JIT compilation");
+    }
+    // The chunk's code, and the closures it makes, live as long as the thread.
+    g_live_engines.push_back(std::move(engine));
+    return entry_fn;
+}
+
+ExecutionResult evalLuaSource(std::string_view source, const ExecutionOptions& opts,
+                              const uint64_t* args, size_t nargs) {
     ExecutionResult result;
     auto& rt = RuntimeState::current();
     try {
-        Chunk chunk = parseLuaSource(source, opts.source_name);
-        analyzeAndInferTypes(chunk, rt);
-
-        brass::Module mod(opts.source_name);
-        MirModuleLowerer lowerer(rt, mod);
-        std::string entry_sym = lowerer.lowerChunk(chunk);
-
-        if (opts.optimize) {
-            brass::PassPipelineOptions popts = brass::production_pass_pipeline_options();
-            popts.enable_sroa = true;
-            brass::run_pass_pipeline(mod, popts);
-        }
-
-        if (opts.dump_mir) {
-            brass::print_module(mod, std::cerr);
-        }
-
-        auto engine = std::make_unique<brass::codegen::JitExecutionEngine>();
-        registerBrassLuaRuntimeSymbols(*engine);
-        if (!engine->compile_and_load(mod)) {
-            result.error_message = "brass JIT compilation failed";
-            return result;
-        }
-
-        auto entry_fn = engine->get_function_ptr<LuaNativeFn>(entry_sym);
-        if (!entry_fn) {
-            result.error_message = "entry symbol not found after JIT compilation";
-            return result;
-        }
-
-        // Keep JIT engine alive so any closures created during execution remain valid
-        g_live_engines.push_back(std::move(engine));
-
+        LuaNativeFn entry_fn = compileLuaChunk(source, opts);
         rt.clearMultiRet();
-        uint64_t ret_bits = entry_fn(nullptr, nullptr, 0);
+        uint64_t ret_bits = entry_fn(nullptr, args, static_cast<int64_t>(nargs));
         result.success = true;
         result.return_value = Value(ret_bits);
         const auto& mret = rt.multiRetVec();
@@ -177,10 +180,14 @@ ExecutionResult evalLuaFile(const std::string& path, const std::vector<std::stri
         }
     }
 
-    RuntimeState::current().setScriptArgs(path, script_args);
+    auto& rt = RuntimeState::current();
+    rt.setScriptArgs(path, script_args);
     ExecutionOptions file_opts = opts;
     file_opts.source_name = "@" + path;
-    return evalLuaSource(content, file_opts);
+    // The script's arguments are its `...`.
+    RuntimeState::RootedValues argv(rt);
+    for (const std::string& a : script_args) argv.values.push_back(rt.makeStringValue(a));
+    return evalLuaSource(content, file_opts, argv.values.data(), argv.values.size());
 }
 
 bool compileLuaToObjectFile(std::string_view source, const std::string& output_path,

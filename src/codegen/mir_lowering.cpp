@@ -93,6 +93,7 @@ void MirModuleLowerer::declareRuntimeExternals() {
     decl("brasslua_rt_fmod");
     decl("brasslua_rt_pow_f64");
     decl("brasslua_rt_idiv_i64");
+    decl("brasslua_rt_forprep");
     decl("brasslua_rt_mod_i64");
 }
 
@@ -319,12 +320,26 @@ MirValue MirModuleLowerer::loadVar(FunctionBuildState& st, uint32_t symbol_id,
         BValue* v = b.build_load(mt, loc->slot_ptr, 0);
         return MirValue{v, loc->rep};
     }
+    if (name == "_ENV") return MirValue{emitEnvConst(st), Rep::Boxed};
     if (intern_id == 0) {
         intern_id = rt_.internString(name);
     }
+    // A global is a field of the env table (pinned, so its address is a
+    // constant of the code): probed inline, the rest (a function __index,
+    // a name the host may answer) left to the runtime.
+    BasicBlock* slow_bb = st.newBlock("glb_ld_slow");
+    BasicBlock* merge_bb = st.newBlock("glb_ld_merge", {Type::i64()});
+    emitFieldProbe(st, emitEnvConst(st), intern_id, /*through_index=*/true,
+                   /*nil_is_hit=*/!rt_.hostBridge().getGlobal, merge_bb, slow_bb);
+    b.position_at_end(slow_bb);
     BValue* id_c = b.build_iconst_i32(static_cast<int32_t>(intern_id));
-    BValue* gv = b.build_call("brasslua_rt_get_global", Type::i64(), {id_c});
-    return MirValue{gv, Rep::Boxed};
+    b.build_br(merge_bb, {b.build_call("brasslua_rt_get_global", Type::i64(), {id_c})});
+    b.position_at_end(merge_bb);
+    return MirValue{merge_bb->param(0), Rep::Boxed};
+}
+
+BValue* MirModuleLowerer::emitEnvConst(FunctionBuildState& st) {
+    return st.builder.build_iconst_i64(static_cast<int64_t>(Value::fromTable(rt_.envTable()).rawBits()));
 }
 
 void MirModuleLowerer::storeVar(FunctionBuildState& st, uint32_t symbol_id,
@@ -350,6 +365,10 @@ void MirModuleLowerer::storeVar(FunctionBuildState& st, uint32_t symbol_id,
         intern_id = rt_.internString(name);
     }
     BValue* boxed = emitBox(st, val);
+    if (!rt_.hostBridge().setGlobal) {
+        emitFieldSet(st, emitEnvConst(st), intern_id, boxed);
+        return;
+    }
     BValue* id_c = b.build_iconst_i32(static_cast<int32_t>(intern_id));
     b.build_call("brasslua_rt_set_global", Type::void_type(), {id_c, boxed});
 }

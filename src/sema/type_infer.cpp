@@ -137,6 +137,8 @@ private:
                     prescanExpr(*e.table);
                     prescanExpr(*e.index);
                 } else if constexpr (std::is_same_v<T, FieldExpr>) {
+                    // `_ENV.setmetatable`, a free name under a local _ENV.
+                    if (e.field == "setmetatable") uses_metatables_ = true;
                     prescanExpr(*e.table);
                 } else if constexpr (std::is_same_v<T, CallExpr>) {
                     if (const auto* callee = std::get_if<IdentExpr>(&e.callee->node)) {
@@ -502,16 +504,24 @@ private:
                     if (s.step) {
                         analyzeExpr(*s.step);
                     }
-                    bool start_int = s.start->inferred_type == InferredType::Int64;
-                    bool stop_int = s.stop->inferred_type == InferredType::Int64;
-                    bool step_int = !s.step || s.step->inferred_type == InferredType::Int64;
-                    s.is_int_loop = start_int && stop_int && step_int;
-
-                    InferredType loop_var_t = s.is_int_loop
-                        ? InferredType::Int64
-                        : ((in_pass1_ && start_int && step_int && s.stop->inferred_type == InferredType::Unknown)
-                               ? InferredType::Unknown
-                               : InferredType::Number);
+                    const InferredType start_t = s.start->inferred_type;
+                    const InferredType step_t = s.step ? s.step->inferred_type : InferredType::Int64;
+                    using Mode = NumericForStmt::Mode;
+                    if (start_t == InferredType::Int64 && step_t == InferredType::Int64) {
+                        s.mode = Mode::Int;
+                    } else if (start_t == InferredType::Float64 || step_t == InferredType::Float64) {
+                        s.mode = Mode::Float;
+                    } else {
+                        s.mode = Mode::Dynamic;
+                    }
+                    InferredType loop_var_t = InferredType::Any;
+                    if (s.mode == Mode::Int) {
+                        loop_var_t = InferredType::Int64;
+                    } else if (s.mode == Mode::Float) {
+                        loop_var_t = InferredType::Float64;
+                    } else if (in_pass1_ && (start_t == InferredType::Unknown || step_t == InferredType::Unknown)) {
+                        loop_var_t = InferredType::Unknown;
+                    }
                     defineVar(s.var_symbol_id, s.var_name, loop_var_t);
                     for (auto& body_stmt : s.body) {
                         analyzeStmt(*body_stmt);

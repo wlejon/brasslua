@@ -69,6 +69,10 @@ LuaTable* getStringMetatable(RuntimeState& rt) noexcept;
 
 LuaCoroutine* getRunningCoroutine(RuntimeState& rt) noexcept;
 void setRunningCoroutine(RuntimeState& rt, LuaCoroutine* co) noexcept;
+// The main thread as a thread value (coroutine.running outside any
+// coroutine). Its status stays Running: coroutine.status says "normal" for
+// it while a coroutine runs.
+LuaCoroutine* getMainThread(RuntimeState& rt);
 
 void recomputeMetatableFlags(RuntimeState& rt, LuaTable* tbl);
 uint32_t getOrComputeMetatableFlags(RuntimeState& rt, LuaTable* mt);
@@ -89,6 +93,9 @@ bool stringToNumber(std::string_view s, Value& out) noexcept;
 bool stringToIntegerInBase(std::string_view s, int base, int64_t& out) noexcept;
 bool tryCoerceToDouble(Value v, double& out) noexcept;
 bool tryCoerceToInt64(Value v, int64_t& out) noexcept;
+// luaG_typeerror: "attempt to <op> a <type> value", a table's or
+// userdata's __name its type.
+[[noreturn]] void throwTypeError(RuntimeState& rt, Value v, const char* op);
 bool tryConvertFloatToExactInt64(double d, int64_t& out) noexcept;
 // A number's string form as Lua writes it (tostring, .., a number passed as
 // a string): "%d" for an integer, "%.14g" for a float with ".0" after one

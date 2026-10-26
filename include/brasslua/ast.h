@@ -235,7 +235,11 @@ struct NumericForStmt {
     ExprPtr stop;
     ExprPtr step; // may be null (default 1)
     std::vector<StmtPtr> body;
-    bool is_int_loop = false;
+    // Lua decides by the initial value and step: both integers make an
+    // integer loop, a float among them a float loop. Dynamic when the types
+    // are not known until the loop starts.
+    enum class Mode : uint8_t { Int, Float, Dynamic };
+    Mode mode = Mode::Dynamic;
     uint32_t var_symbol_id = 0;
     bool var_is_captured = false;
 };

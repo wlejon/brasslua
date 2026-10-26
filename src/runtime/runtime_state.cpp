@@ -298,7 +298,6 @@ struct RuntimeState::Impl {
                 id_to_lstr[id] = nullptr;
                 intern_state[id] = kFree;
                 free_ids.push_back(id);
-                globals_by_id[id] = Value::nil();
                 any = true;
             }
         }
@@ -306,13 +305,16 @@ struct RuntimeState::Impl {
     }
 
     std::vector<RuntimeState::RootedValues*> rooted_values;
-    std::vector<Value> globals_by_id;
     LuaTable* env_table = nullptr;
     LuaTable* string_metatable = nullptr;
     LuaCoroutine* running_coroutine = nullptr;
+    LuaCoroutine* main_thread = nullptr; // made when first asked for
     bool in_explicit_gc = false;
 
     void traceRoots(brass::gc::Tracer& t, RuntimeState& rt) {
+        if (main_thread) {
+            t.visit_address(reinterpret_cast<uintptr_t*>(&main_thread));
+        }
         if (env_table) {
             t.visit_address(reinterpret_cast<uintptr_t*>(&env_table));
         }
@@ -331,9 +333,6 @@ struct RuntimeState::Impl {
                 intern_weak_slot[id] = Value::fromString(s).rawBits();
                 t.visit_weak(&intern_weak_slot[id], kNilBits);
             }
-        }
-        for (Value& v : globals_by_id) {
-            t.visit(reinterpret_cast<uint64_t*>(&v));
         }
         for (RuntimeState::RootedValues* r : rooted_values) {
             for (uint64_t& v : r->values) t.visit(&v);
@@ -511,10 +510,10 @@ void RuntimeState::reset() {
     impl_->intern_state.clear();
     impl_->intern_weak_slot.clear();
     impl_->free_ids.clear();
-    impl_->globals_by_id.clear();
     impl_->env_table = nullptr;
     impl_->string_metatable = nullptr;
     impl_->running_coroutine = nullptr;
+    impl_->main_thread = nullptr;
     multiret_.clear();
     single_ret_ = kNilBits;
     multiret_mode_ = 0;
@@ -580,9 +579,6 @@ uint32_t RuntimeState::adoptInterned(LuaString* lstr, uint32_t hash, bool weak) 
     lstr->hash = hash;
     lstr->intern_id = id;
     impl_->str_to_id.insert(hash, id);
-    if (impl_->globals_by_id.size() <= id) {
-        impl_->globals_by_id.resize(id + 1, Value::nil());
-    }
     return id;
 }
 
@@ -638,49 +634,17 @@ LuaTable* RuntimeState::envTable() const noexcept {
 }
 
 void RuntimeState::setGlobal(std::string_view name, Value val) {
-    uint32_t id = internString(name);
-    setGlobalById(id, val);
-}
-
-void RuntimeState::setGlobalById(uint32_t intern_id, Value val) {
-    if (intern_id >= impl_->globals_by_id.size()) {
-        impl_->globals_by_id.resize(intern_id + 1, Value::nil());
-    }
-    impl_->globals_by_id[intern_id] = val;
-    if (impl_->env_table) {
-        brasslua_rt_table_set_field(Value::fromTable(impl_->env_table).rawBits(),
-                                    Value::fromString(impl_->id_to_lstr[intern_id]).rawBits(), val.rawBits());
-    }
+    const uint32_t id = internString(name);
+    brasslua_rt_rawset(Value::fromTable(impl_->env_table).rawBits(),
+                       Value::fromString(impl_->id_to_lstr[id]).rawBits(), val.rawBits());
 }
 
 Value RuntimeState::getGlobal(std::string_view name) {
-    uint32_t id = internString(name);
-    return getGlobalById(id);
-}
-
-Value RuntimeState::getGlobalById(uint32_t intern_id) {
-    if (intern_id < impl_->globals_by_id.size()) {
-        Value v = impl_->globals_by_id[intern_id];
-        if (!v.isNil()) {
-            return v;
-        }
-    }
-    if (impl_->env_table) {
-        uint64_t tv = brasslua_rt_rawget(
-            Value::fromTable(impl_->env_table).rawBits(),
-            Value::fromString(getLuaStringById(intern_id)).rawBits());
-        if (!Value(tv).isNil()) {
-            return Value(tv);
-        }
-    }
-    if (host_bridge_.getGlobal) {
-        std::string_view name = getStringById(intern_id);
-        uint64_t hv = host_bridge_.getGlobal(name);
-        if (!Value(hv).isNil()) {
-            return Value(hv);
-        }
-    }
-    return Value::nil();
+    const uint32_t id = internString(name);
+    uint64_t v = brasslua_rt_rawget(Value::fromTable(impl_->env_table).rawBits(),
+                                    Value::fromString(impl_->id_to_lstr[id]).rawBits());
+    if (Value(v).isNil() && host_bridge_.getGlobal) v = host_bridge_.getGlobal(name);
+    return Value(v);
 }
 
 void RuntimeState::ensureTableArrayCapacity(LuaTable* tbl, uint32_t min_cap) {
@@ -916,6 +880,15 @@ LuaCoroutine* getRunningCoroutine(RuntimeState& rt) noexcept {
 
 void setRunningCoroutine(RuntimeState& rt, LuaCoroutine* co) noexcept {
     rt.impl()->running_coroutine = co;
+}
+
+LuaCoroutine* getMainThread(RuntimeState& rt) {
+    if (!rt.impl()->main_thread) {
+        LuaCoroutine* co = rt.allocCoroutine(nullptr);
+        co->status = CoroutineStatus::Running;
+        rt.impl()->main_thread = co;
+    }
+    return rt.impl()->main_thread;
 }
 
 void armTableFinalizerIfNeeded(RuntimeState& rt, LuaTable* tbl) {

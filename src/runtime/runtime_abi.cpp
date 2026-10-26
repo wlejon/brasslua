@@ -383,9 +383,13 @@ std::string valueToStdString(RuntimeState& rt, Value v) {
             std::string hs = rt.hostBridge().toString(v.rawBits());
             if (!hs.empty()) return hs;
         }
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "%s: %p", v.isTable() ? "table" : "userdata", v.asPointer());
-        return std::string(buf);
+        // luaL_tolstring: the kind is the metatable's __name when a string.
+        Value name = lookupMetamethod(rt, v, "__name");
+        std::string kind = name.isString() ? std::string(valueToStringView(rt, name))
+                                           : (v.isTable() ? "table" : "userdata");
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), ": %p", v.asPointer());
+        return kind + buf;
     }
     if (v.isCoroutine()) {
         char buf[64];
@@ -539,9 +543,7 @@ uint64_t brasslua_rt_table_get(uint64_t table, uint64_t key) {
             continue;
         }
         Value idx_mm = lookupMetamethod(rt, cur, "__index");
-        if (idx_mm.isNil()) {
-            throw LuaRuntimeError("attempt to index a non-table value");
-        }
+        if (idx_mm.isNil()) throwTypeError(rt, cur, "index");
         if (idx_mm.isFunction()) {
             return brasslua_rt_call_2(idx_mm.rawBits(), cur.rawBits(), key);
         }
@@ -592,7 +594,7 @@ uint64_t brasslua_rt_table_set(uint64_t table, uint64_t key, uint64_t val) {
             cur = ni_mm;
             continue;
         }
-        throw LuaRuntimeError("attempt to index a non-table value");
+        throwTypeError(rt, cur, "index");
     }
     return table;
 }

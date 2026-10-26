@@ -269,29 +269,42 @@ uint64_t tblSort(void*, const uint64_t* args, int64_t nargs) {
 
 // ---- io ----
 
-uint64_t ioWrite(void*, const uint64_t* args, int64_t nargs) {
+// g_write: strings as they are, integers with "%lld" and floats with
+// "%.14g" (not tostring's form: 1.0 writes "1"). Returns the file, the
+// closure's upvalue; a file's write method takes it as its first argument.
+uint64_t writeValues(void* cl, const uint64_t* args, int64_t nargs, bool to_stderr, bool method) {
     auto& rt = RuntimeState::current();
-    int64_t start = 0;
-    if (nargs >= 1 && Value(args[0]).isTable()) {
-        start = 1; // called as io.stdout:write(...)
+    const Args a(args, nargs, "write");
+    for (int64_t i = method ? 2 : 1; i <= nargs; ++i) {
+        const Value v = a.at(i);
+        char buf[kNumberBufSize];
+        std::string_view s;
+        if (v.isInteger()) {
+            s = std::string_view(buf, std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(v.asInt64())));
+        } else if (v.isFloat()) {
+            s = std::string_view(buf, std::snprintf(buf, sizeof(buf), "%.14g", v.asDouble()));
+        } else if (v.isString()) {
+            s = valueToStringView(rt, v);
+        } else {
+            a.typeError(method ? i - 1 : i, "string");
+        }
+        if (to_stderr) {
+            std::fwrite(s.data(), 1, s.size(), stderr);
+        } else {
+            rt.writeOutput(s);
+        }
     }
-    for (int64_t i = start; i < nargs; ++i) {
-        rt.writeOutput(valueToStdString(rt, Value(args[i])));
-    }
-    return Value::fromBool(true).rawBits();
+    return static_cast<LuaClosure*>(cl)->upvalues[0]->value;
 }
 
-uint64_t ioStderrWrite(void*, const uint64_t* args, int64_t nargs) {
-    auto& rt = RuntimeState::current();
-    int64_t start = 0;
-    if (nargs >= 1 && Value(args[0]).isTable()) {
-        start = 1; // called as io.stderr:write(...)
-    }
-    for (int64_t i = start; i < nargs; ++i) {
-        std::string s = valueToStdString(rt, Value(args[i]));
-        std::fwrite(s.data(), 1, s.size(), stderr);
-    }
-    return Value::fromBool(true).rawBits();
+uint64_t ioWrite(void* cl, const uint64_t* args, int64_t nargs) {
+    return writeValues(cl, args, nargs, false, false);
+}
+uint64_t stdoutWrite(void* cl, const uint64_t* args, int64_t nargs) {
+    return writeValues(cl, args, nargs, false, true);
+}
+uint64_t stderrWrite(void* cl, const uint64_t* args, int64_t nargs) {
+    return writeValues(cl, args, nargs, true, true);
 }
 
 uint64_t ioFlush(void*, const uint64_t*, int64_t) {
@@ -316,15 +329,19 @@ void registerTableStdlib(RuntimeState& rt) {
 
 void registerIoStdlib(RuntimeState& rt) {
     LuaTable* io_tbl = rt.allocTable(0, 8);
-    Value write_fn = makeNativeClosure(rt, &ioWrite, 1);
     Value flush_fn = makeNativeClosure(rt, &ioFlush, 0);
-    setTableFieldStr(rt, io_tbl, "write", write_fn);
-    setTableFieldStr(rt, io_tbl, "flush", flush_fn);
     LuaTable* stdout_tbl = rt.allocTable(0, 4);
-    setTableFieldStr(rt, stdout_tbl, "write", write_fn);
-    setTableFieldStr(rt, stdout_tbl, "flush", flush_fn);
     LuaTable* stderr_tbl = rt.allocTable(0, 4);
-    setTableFieldStr(rt, stderr_tbl, "write", makeNativeClosure(rt, &ioStderrWrite, 1));
+    auto writer = [&](LuaNativeFn fn, LuaTable* file) {
+        LuaClosure* cl = rt.allocClosure(fn, nullptr, 1, 0, true);
+        cl->upvalues[0]->value = Value::fromTable(file).rawBits();
+        return Value::fromFunction(cl);
+    };
+    setTableFieldStr(rt, io_tbl, "write", writer(&ioWrite, stdout_tbl));
+    setTableFieldStr(rt, io_tbl, "flush", flush_fn);
+    setTableFieldStr(rt, stdout_tbl, "write", writer(&stdoutWrite, stdout_tbl));
+    setTableFieldStr(rt, stdout_tbl, "flush", flush_fn);
+    setTableFieldStr(rt, stderr_tbl, "write", writer(&stderrWrite, stderr_tbl));
     setTableFieldStr(rt, stderr_tbl, "flush", flush_fn);
     setTableFieldStr(rt, io_tbl, "stdout", Value::fromTable(stdout_tbl));
     setTableFieldStr(rt, io_tbl, "stderr", Value::fromTable(stderr_tbl));

@@ -133,6 +133,9 @@ private:
                 } else if constexpr (std::is_same_v<T, AssignStmt>) {
                     for (auto& te : s.targets) {
                         resolveExpr(*te);
+                        if (const auto* id = std::get_if<IdentExpr>(&te->node)) {
+                            if (id->symbol_id == 0 && id->name == "_ENV") assigns_free_env_ = true;
+                        }
                     }
                     for (auto& ve : s.values) {
                         resolveExpr(*ve);
@@ -185,6 +188,9 @@ private:
                         // `local function f()` defines `f` before resolving its body
                         s.root_symbol_id = defineSymbol(s.path[0], &s.root_is_captured, nullptr);
                     } else if (!s.path.empty()) {
+                        if (s.path[0] != "_ENV" && !isVisible(s.path[0]) && isVisible("_ENV")) {
+                            s.path.insert(s.path.begin(), "_ENV");
+                        }
                         s.root_symbol_id = useSymbol(s.path[0]);
                         s.root_is_captured = false;
                     }
@@ -198,7 +204,21 @@ private:
             stmt.node);
     }
 
+    bool isVisible(const std::string& name) const {
+        for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+            if (it->count(name)) return true;
+        }
+        return false;
+    }
+
     void resolveExpr(Expr& expr) {
+        // A free name is a field of _ENV: of a visible local _ENV, as one;
+        // otherwise of the env table, a global.
+        if (auto* id = std::get_if<IdentExpr>(&expr.node);
+            id && id->name != "_ENV" && !isVisible(id->name) && isVisible("_ENV")) {
+            std::string name = std::move(id->name);
+            expr.node = FieldExpr{std::make_unique<Expr>(IdentExpr{"_ENV"}, expr.loc), std::move(name)};
+        }
         std::visit(
             [&](auto& e) {
                 using T = std::decay_t<decltype(e)>;
@@ -232,6 +252,10 @@ private:
             expr.node);
     }
 
+public:
+    bool assigns_free_env_ = false;
+
+private:
     uint32_t next_symbol_id_ = 1;
     std::vector<FuncBody*> func_stack_;
     std::vector<std::unordered_map<std::string, DeclEntry>> scopes_;
@@ -242,6 +266,16 @@ private:
 void resolveChunkSymbols(Chunk& chunk) {
     SymbolResolver resolver;
     resolver.run(chunk);
+    if (!resolver.assigns_free_env_) return;
+    // The chunk's _ENV is its upvalue, which an assignment changes for every
+    // function of the chunk: it is a local at the chunk's top, made from
+    // the env table (a free _ENV read), and the chunk resolved again.
+    LocalStmt env;
+    env.vars.push_back(LocalAttr{"_ENV"});
+    env.init.push_back(std::make_unique<Expr>(IdentExpr{"_ENV"}));
+    chunk.body.insert(chunk.body.begin(), std::make_unique<Stmt>(std::move(env)));
+    SymbolResolver again;
+    again.run(chunk);
 }
 
 } // namespace brasslua
