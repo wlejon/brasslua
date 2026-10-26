@@ -85,7 +85,10 @@ public:
                 finalizeFuncBody(fkey, *it->second);
             }
         }
-        locals_.clear();
+        // The last pass keeps the variables' types: a variable's hint is
+        // what is ever assigned to it, so a read in a loop sees what the
+        // loop assigns after it (a sum begun as 0 and added floats to is a
+        // number, not the integer it starts as).
         for (auto& stmt : chunk.body) {
             analyzeStmt(*stmt);
         }
@@ -282,12 +285,14 @@ private:
             if (vb.attr) vb.attr->inferred_type = vb.type;
             return;
         }
-        if (attr) {
-            attr->inferred_type = t;
-        }
         if (symbol_id != 0) {
-            locals_[symbol_id] = VarBinding{t, attr};
+            // Defined again by a later pass: what it held then still counts.
+            VarBinding& vb = locals_[symbol_id];
+            vb.type = joinTypes(vb.type, t);
+            if (attr) vb.attr = attr;
+            if (vb.attr) vb.attr->inferred_type = vb.type;
         } else {
+            if (attr) attr->inferred_type = t;
             globals_[name] = t;
         }
     }
