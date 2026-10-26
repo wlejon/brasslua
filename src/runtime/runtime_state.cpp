@@ -5,6 +5,7 @@
 #include <brass/gc/object.hpp>
 #include <brass/gc/tracer.hpp>
 
+#include <algorithm>
 #include <csetjmp>
 #include <cstdlib>
 #include <cstring>
