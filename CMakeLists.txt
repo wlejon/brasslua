@@ -163,6 +163,13 @@ if(BRASSLUA_BUILD_TESTS)
         )
         target_link_libraries(brasslua_bronze_tests PRIVATE brasslua_bronze)
         brasslua_extern_c_may_throw(brasslua_bronze_tests)
+        # bronze_runtime_shared builds into its own directory; the loader finds it beside the exe.
+        if(WIN32)
+            add_custom_command(TARGET brasslua_bronze_tests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_RUNTIME_DLLS:brasslua_bronze_tests> $<TARGET_FILE_DIR:brasslua_bronze_tests>
+                COMMAND_EXPAND_LISTS)
+        endif()
         add_test(NAME brasslua_bronze_bridge_tests COMMAND brasslua_bronze_tests)
     endif()
 endif()

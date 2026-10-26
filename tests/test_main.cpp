@@ -1,3 +1,5 @@
+#include "no_error_dialogs.h"
+
 #include <iostream>
 
 namespace brasslua::tests {
@@ -7,6 +9,7 @@ int runLuaOracleTests();
 } // namespace brasslua::tests
 
 int main() {
+    brasslua::tests::disableErrorDialogs();
     int failures = 0;
     failures += brasslua::tests::runLexerParserTests();
     failures += brasslua::tests::runRuntimeJitTests();

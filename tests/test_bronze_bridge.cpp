@@ -1,5 +1,6 @@
 #include "brasslua/bronze_bridge.h"
 #include "runtime/runtime_internal.h"
+#include "no_error_dialogs.h"
 
 #include <brass/gc/heap.hpp>
 
@@ -377,6 +378,7 @@ void testMethodCallVsPlainCall() {
 } // namespace
 
 int main() {
+    brasslua::tests::disableErrorDialogs();
     std::printf("=== Running brasslua_bronze Bridge & Shared Heap Tests ===\n");
     testSharedHeapAndGlobals();
     testStringsAndBinaryRule1();
