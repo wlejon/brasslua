@@ -48,6 +48,8 @@ public:
     void collectGarbage();
 
     // String interning (8-bit clean byte strings)
+    // internString's string lives as long as the runtime (its id may be
+    // compiled into code); makeStringValue's is collected when unreferenced.
     uint32_t internString(std::string_view str);
     std::string_view getStringById(uint32_t id) const;
     LuaString* getLuaStringById(uint32_t id);
@@ -135,8 +137,11 @@ private:
     RuntimeState();
     ~RuntimeState();
 
+    // The interned string of these bytes, made (weakly held or not) when
+    // there is none.
+    uint32_t internAs(std::string_view str, bool weak);
     // Enters a string not yet interned into the intern table.
-    uint32_t adoptInterned(LuaString* lstr, uint32_t hash);
+    uint32_t adoptInterned(LuaString* lstr, uint32_t hash, bool weak);
 
     Impl* impl_;
     std::vector<uint64_t> multiret_;

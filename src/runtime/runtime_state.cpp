@@ -232,6 +232,18 @@ public:
         count_ = 0;
     }
 
+    // Holds just the strings still interned (null entries are gone).
+    void rebuild(const std::vector<LuaString*>& strings) {
+        std::fill(slots_.begin(), slots_.end(), Slot{});
+        count_ = 0;
+        for (uint32_t id = 0; id < strings.size(); ++id) {
+            if (strings[id]) {
+                place(strings[id]->hash, id);
+                ++count_;
+            }
+        }
+    }
+
 private:
     struct Slot {
         uint32_t hash = 0;
@@ -263,10 +275,35 @@ struct RuntimeState::Impl {
     brass::gc::Heap::RootSourceId root_source_id = 0;
     uintptr_t stack_top_anchor = 0;
 
-    // Interned strings live as long as the runtime: id_to_lstr roots them
-    // and they never move.
+    // Interned strings never move. Those the compiler or the runtime names
+    // (constants, globals, metamethod names) are roots for as long as the
+    // runtime lives; one only made at run time is held weakly, so it is
+    // collected like Lua's, when nothing else refers to it, and its id goes
+    // back to be reused.
+    enum InternState : uint8_t { kFree, kWeak, kStrong };
     InternTable str_to_id;
     std::vector<LuaString*> id_to_lstr;
+    std::vector<uint8_t> intern_state;
+    // A weak string's value: the slot the collector clears (a weak slot must
+    // hold a tagged reference, not id_to_lstr's raw pointer).
+    std::vector<uint64_t> intern_weak_slot;
+    std::vector<uint32_t> free_ids;
+    brass::gc::Heap::RootSourceId post_collection_hook_id = 0;
+
+    // After a full collection settles weak slots: drops the dead strings.
+    void sweepInterned() {
+        bool any = false;
+        for (uint32_t id = 0; id < id_to_lstr.size(); ++id) {
+            if (intern_state[id] == kWeak && intern_weak_slot[id] == kNilBits) {
+                id_to_lstr[id] = nullptr;
+                intern_state[id] = kFree;
+                free_ids.push_back(id);
+                globals_by_id[id] = Value::nil();
+                any = true;
+            }
+        }
+        if (any) str_to_id.rebuild(id_to_lstr);
+    }
 
     std::vector<RuntimeState::RootedValues*> rooted_values;
     std::vector<Value> globals_by_id;
@@ -285,9 +322,14 @@ struct RuntimeState::Impl {
         if (running_coroutine) {
             t.visit_address(reinterpret_cast<uintptr_t*>(&running_coroutine));
         }
-        for (LuaString*& s : id_to_lstr) {
-            if (s) {
+        for (size_t id = 0; id < id_to_lstr.size(); ++id) {
+            LuaString*& s = id_to_lstr[id];
+            if (!s) continue;
+            if (intern_state[id] == kStrong) {
                 t.visit_address(reinterpret_cast<uintptr_t*>(&s));
+            } else {
+                intern_weak_slot[id] = Value::fromString(s).rawBits();
+                t.visit_weak(&intern_weak_slot[id], kNilBits);
             }
         }
         for (Value& v : globals_by_id) {
@@ -361,24 +403,31 @@ struct RuntimeState::Impl {
     }
 
     void bindHeap(brass::gc::Heap* h, RuntimeState& rt) {
-        if (active_heap && root_source_id != 0) {
-            active_heap->remove_root_source(root_source_id);
-            root_source_id = 0;
-        }
+        unbindHeap();
         active_heap = h;
         if (active_heap) {
             brass::gc::Heap::set_current(active_heap);
             root_source_id = active_heap->add_root_source(
                 [this, &rt](brass::gc::Tracer& t) { traceRoots(t, rt); });
+            post_collection_hook_id = active_heap->add_post_collection_hook(
+                [this](brass::gc::Heap&, brass::gc::CollectionKind kind) {
+                    if (kind == brass::gc::CollectionKind::Full) sweepInterned();
+                });
         }
     }
 
-    ~Impl() {
+    void unbindHeap() noexcept {
         if (active_heap && root_source_id != 0) {
             active_heap->remove_root_source(root_source_id);
             root_source_id = 0;
         }
+        if (active_heap && post_collection_hook_id != 0) {
+            active_heap->remove_post_collection_hook(post_collection_hook_id);
+            post_collection_hook_id = 0;
+        }
     }
+
+    ~Impl() { unbindHeap(); }
 };
 
 namespace {
@@ -451,16 +500,17 @@ void RuntimeState::reset() {
     }
 
     if (!impl_->active_heap || impl_->owned_heap != nullptr) {
-        if (impl_->active_heap && impl_->root_source_id != 0) {
-            impl_->active_heap->remove_root_source(impl_->root_source_id);
-            impl_->root_source_id = 0;
-        }
+        impl_->unbindHeap();
+        impl_->active_heap = nullptr;
         impl_->owned_heap = std::make_unique<brass::gc::Heap>(makeBrassLuaHeapConfig());
         impl_->bindHeap(impl_->owned_heap.get(), *this);
     }
 
     impl_->str_to_id.clear();
     impl_->id_to_lstr.clear();
+    impl_->intern_state.clear();
+    impl_->intern_weak_slot.clear();
+    impl_->free_ids.clear();
     impl_->globals_by_id.clear();
     impl_->env_table = nullptr;
     impl_->string_metatable = nullptr;
@@ -485,10 +535,16 @@ void RuntimeState::registerStdlib() {
 }
 
 uint32_t RuntimeState::internString(std::string_view str) {
+    const uint32_t id = internAs(str, false);
+    impl_->intern_state[id] = Impl::kStrong;
+    return id;
+}
+
+uint32_t RuntimeState::internAs(std::string_view str, bool weak) {
     const uint32_t hash = fnv1aHash(str);
     const uint32_t id = impl_->str_to_id.find(str, hash, impl_->id_to_lstr);
     if (id != kNotInterned) return id;
-    return adoptInterned(allocString(str), hash);
+    return adoptInterned(allocString(str), hash, weak);
 }
 
 LuaString* RuntimeState::allocString(std::string_view str) {
@@ -508,11 +564,21 @@ LuaString* RuntimeState::allocString(std::string_view str) {
     return lstr;
 }
 
-uint32_t RuntimeState::adoptInterned(LuaString* lstr, uint32_t hash) {
-    uint32_t id = static_cast<uint32_t>(impl_->id_to_lstr.size());
+uint32_t RuntimeState::adoptInterned(LuaString* lstr, uint32_t hash, bool weak) {
+    uint32_t id = 0;
+    if (!impl_->free_ids.empty()) {
+        id = impl_->free_ids.back();
+        impl_->free_ids.pop_back();
+        impl_->id_to_lstr[id] = lstr;
+    } else {
+        id = static_cast<uint32_t>(impl_->id_to_lstr.size());
+        impl_->id_to_lstr.push_back(lstr);
+        impl_->intern_state.push_back(Impl::kFree);
+        impl_->intern_weak_slot.push_back(kNilBits);
+    }
+    impl_->intern_state[id] = weak ? Impl::kWeak : Impl::kStrong;
     lstr->hash = hash;
     lstr->intern_id = id;
-    impl_->id_to_lstr.push_back(lstr);
     impl_->str_to_id.insert(hash, id);
     if (impl_->globals_by_id.size() <= id) {
         impl_->globals_by_id.resize(id + 1, Value::nil());
@@ -530,7 +596,7 @@ uint64_t RuntimeState::internKey(uint64_t str_bits, bool insert) {
         return Value::fromString(impl_->id_to_lstr[id]).rawBits();
     }
     if (!insert) return kNilBits;
-    adoptInterned(lstr, hash);
+    adoptInterned(lstr, hash, true);
     return str_bits;
 }
 
@@ -563,7 +629,7 @@ uint64_t RuntimeState::makeStringValue(std::string_view str) {
     if (str.size() > kShortStringMax) {
         return Value::fromString(allocString(str)).rawBits();
     }
-    uint32_t id = internString(str);
+    uint32_t id = internAs(str, true);
     return Value::fromString(impl_->id_to_lstr[id]).rawBits();
 }
 
