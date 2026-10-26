@@ -58,6 +58,7 @@ find_package(Threads REQUIRED)
 add_library(brasslua STATIC
     src/lex/lexer.cpp
     src/parse/parser.cpp
+    src/sema/ast_walk.cpp
     src/sema/symbol_resolve.cpp
     src/sema/type_infer.cpp
     src/runtime/runtime_state.cpp
@@ -76,6 +77,7 @@ add_library(brasslua STATIC
     src/codegen/mir_lowering_expr.cpp
     src/codegen/mir_lowering_stmt.cpp
     src/codegen/mir_lowering_for.cpp
+    src/codegen/speculation.cpp
     src/codegen/jit_runner.cpp
 )
 add_library(brasslua::brasslua ALIAS brasslua)

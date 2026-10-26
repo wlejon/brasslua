@@ -21,6 +21,9 @@ using brass::Type;
 namespace {
 
 thread_local std::vector<std::unique_ptr<brass::codegen::JitExecutionEngine>> g_live_engines;
+// Each chunk's speculation, which resumes its failed guards; dropped before
+// the engines holding the code.
+thread_local std::vector<std::unique_ptr<ChunkSpeculation>> g_live_speculation;
 
 } // namespace
 
@@ -106,6 +109,8 @@ LuaNativeFn compileLuaChunk(std::string_view source, const ExecutionOptions& opt
     brass::Module mod(opts.source_name);
     MirModuleLowerer lowerer(rt, mod);
     std::string entry_sym = lowerer.lowerChunk(chunk);
+    auto spec = std::make_unique<ChunkSpeculation>();
+    spec->arm(mod, lowerer.takeBets());
 
     if (opts.optimize) {
         brass::PassPipelineOptions popts = brass::production_pass_pipeline_options();
@@ -126,8 +131,10 @@ LuaNativeFn compileLuaChunk(std::string_view source, const ExecutionOptions& opt
     if (!entry_fn) {
         throw std::runtime_error("entry symbol not found after JIT compilation");
     }
+    spec->install(*engine);
     // The chunk's code, and the closures it makes, live as long as the thread.
     g_live_engines.push_back(std::move(engine));
+    g_live_speculation.push_back(std::move(spec));
     return entry_fn;
 }
 

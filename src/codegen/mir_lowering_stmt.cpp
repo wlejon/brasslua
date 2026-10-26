@@ -99,9 +99,9 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                     if (const auto* id = std::get_if<IdentExpr>(&tgt.node)) {
                         storeVar(st, id->symbol_id, id->name, id->intern_id, final_rhs[i]);
                     } else if (const auto* idx = std::get_if<IndexExpr>(&tgt.node)) {
-                        lowerIndexStore(st, *idx, final_rhs[i], tgt.inferred_type);
+                        lowerIndexStore(st, *idx, final_rhs[i]);
                     } else if (const auto* fld = std::get_if<FieldExpr>(&tgt.node)) {
-                        lowerFieldStore(st, *fld, final_rhs[i], tgt.inferred_type);
+                        lowerFieldStore(st, *fld, final_rhs[i]);
                     }
                 }
             } else if constexpr (std::is_same_v<T, ExprStmt>) {

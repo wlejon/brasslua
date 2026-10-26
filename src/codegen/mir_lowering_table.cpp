@@ -6,45 +6,41 @@ namespace brasslua {
 using brass::BasicBlock;
 using brass::Type;
 
-MirValue MirModuleLowerer::lowerIndexLoad(FunctionBuildState& st, const IndexExpr& idx_expr,
-                                          InferredType inferred_type) {
+namespace {
+
+// A boxed key the hints bet is an inline integer: ends the block with the
+// site, positions at its fast side and gives the key's integer there, the
+// slow side `slow_bb` (null when the key is not such a bet).
+BValue* emitIntKeyBet(MirModuleLowerer& lowerer, FunctionBuildState& st, const Expr& key, MirValue key_mv,
+                      BValue* key_bits, BasicBlock*& slow_bb) {
+    slow_bb = nullptr;
+    if (key_mv.rep != Rep::Boxed || key.hint != InferredType::Int64) return nullptr;
+    auto& b = st.builder;
+    BValue* is_int = b.build_eq(b.build_lshr(key_bits, b.build_iconst_i64(48)),
+                                b.build_iconst_i64(static_cast<int64_t>(Tag::Int47)));
+    BasicBlock* fast_bb = st.newBlock("key_int");
+    slow_bb = st.newBlock("key_any");
+    lowerer.emitSite(st, is_int, fast_bb, slow_bb, true);
+    b.position_at_end(fast_bb);
+    BValue* c16 = b.build_iconst_i64(16);
+    return b.build_ashr(b.build_shl(key_bits, c16), c16);
+}
+
+} // namespace
+
+MirValue MirModuleLowerer::lowerIndexLoad(FunctionBuildState& st, const IndexExpr& idx_expr) {
     auto& b = st.builder;
     MirValue tbl_mv = lowerExpr(st, *idx_expr.table);
     BValue* tbl_bits = emitBox(st, tbl_mv);
     MirValue key_mv = lowerExpr(st, *idx_expr.index);
 
-    if (key_mv.rep == Rep::Int64 || idx_expr.index->inferred_type == InferredType::Int64) {
-        BValue* idx_i64 = emitUnboxInt64(st, key_mv);
-        bool known_plain_tbl = (inferred_type == InferredType::Float64 ||
-                                inferred_type == InferredType::Int64 ||
-                                inferred_type == InferredType::Number ||
-                                inferred_type == InferredType::Table);
-        if (known_plain_tbl) {
-            // Inference says a plain table: only the bounds are checked here.
-            BValue* payload_mask = b.build_iconst_i64(static_cast<int64_t>(kPayloadMask));
-            BValue* tbl_ptr = b.build_and(tbl_bits, payload_mask);
-            BValue* zero_idx = b.build_sub(idx_i64, b.build_iconst_i64(1));
-            BValue* cap_i64 = b.build_zext_i64(
-                b.build_load(Type::i32(), tbl_ptr, static_cast<int32_t>(offsetof(LuaTable, array_cap))));
-            const bool as_f64 = inferred_type == InferredType::Float64;
-            const Type rep_ty = as_f64 ? Type::f64() : Type::i64();
-            BasicBlock* fast_bb = st.newBlock("arr_ld_fast");
-            BasicBlock* slow_bb = st.newBlock("arr_ld_slow");
-            BasicBlock* merge_bb = st.newBlock("arr_ld_merge", {rep_ty});
-            b.build_br_if(b.build_ult(zero_idx, cap_i64), fast_bb, slow_bb);
-
-            b.position_at_end(fast_bb);
-            BValue* arr_ptr = b.build_load(Type::ptr(), tbl_ptr, static_cast<int32_t>(offsetof(LuaTable, array_data)));
-            b.build_br(merge_bb, {b.build_load_indexed(rep_ty, arr_ptr, zero_idx, 8)});
-
-            b.position_at_end(slow_bb);
-            BValue* slow_val = b.build_call("brasslua_rt_table_get_int", Type::i64(), {tbl_bits, idx_i64});
-            if (as_f64) slow_val = emitUnboxFloat64(st, MirValue{slow_val, Rep::Boxed});
-            b.build_br(merge_bb, {slow_val});
-
-            b.position_at_end(merge_bb);
-            return MirValue{merge_bb->param(0), as_f64 ? Rep::Float64 : Rep::Boxed};
-        }
+    // Boxed only where the generic code reads it: boxing a big integer is a
+    // call nothing would remove.
+    BasicBlock* key_any_bb = nullptr;
+    BValue* key_bits = key_mv.rep == Rep::Boxed ? key_mv.val : nullptr;
+    BValue* bet_idx = emitIntKeyBet(*this, st, *idx_expr.index, key_mv, key_bits, key_any_bb);
+    if (bet_idx || key_mv.rep == Rep::Int64 || idx_expr.index->inferred_type == InferredType::Int64) {
+        BValue* idx_i64 = bet_idx ? bet_idx : emitUnboxInt64(st, key_mv);
         // Fast inline array load when:
         // 1. (tbl_bits >> 48) == Tag::Object (0xFFF1)
         // 2. tbl->flags == 0 (regular table without __index metamethod)
@@ -80,90 +76,32 @@ MirValue MirModuleLowerer::lowerIndexLoad(FunctionBuildState& st, const IndexExp
         b.build_br(merge_bb, {slow_val});
 
         b.position_at_end(merge_bb);
-        return MirValue{merge_bb->param(0), Rep::Boxed};
+        if (!key_any_bb) return MirValue{merge_bb->param(0), Rep::Boxed};
+        BasicBlock* done_bb = st.newBlock("key_merge", {Type::i64()});
+        b.build_br(done_bb, {merge_bb->param(0)});
+        b.position_at_end(key_any_bb);
+        b.build_br(done_bb, {b.build_call("brasslua_rt_table_get", Type::i64(), {tbl_bits, key_bits})});
+        b.position_at_end(done_bb);
+        return MirValue{done_bb->param(0), Rep::Boxed};
     }
 
-    BValue* key_bits = emitBox(st, key_mv);
+    if (!key_bits) key_bits = emitBox(st, key_mv);
     BValue* res = b.build_call("brasslua_rt_table_get", Type::i64(), {tbl_bits, key_bits});
     return MirValue{res, Rep::Boxed};
 }
 
-void MirModuleLowerer::lowerIndexStore(FunctionBuildState& st, const IndexExpr& idx_expr, MirValue rhs,
-                                       InferredType target_type) {
+void MirModuleLowerer::lowerIndexStore(FunctionBuildState& st, const IndexExpr& idx_expr, MirValue rhs) {
     auto& b = st.builder;
     MirValue tbl_mv = lowerExpr(st, *idx_expr.table);
     BValue* tbl_bits = emitBox(st, tbl_mv);
     MirValue key_mv = lowerExpr(st, *idx_expr.index);
 
-    if (key_mv.rep == Rep::Int64 || idx_expr.index->inferred_type == InferredType::Int64) {
-        BValue* idx_i64 = emitUnboxInt64(st, key_mv);
-        bool known_plain_tbl = (target_type == InferredType::Float64 ||
-                                target_type == InferredType::Int64 ||
-                                target_type == InferredType::Number ||
-                                target_type == InferredType::Table);
-        if (known_plain_tbl) {
-            BValue* payload_mask = b.build_iconst_i64(static_cast<int64_t>(kPayloadMask));
-            BValue* tbl_ptr = b.build_and(tbl_bits, payload_mask);
-            BValue* cap_i32 = b.build_load(Type::i32(), tbl_ptr, static_cast<int32_t>(offsetof(LuaTable, array_cap)));
-            BValue* cap_i64 = b.build_zext_i64(cap_i32);
-            BValue* zero_idx = b.build_sub(idx_i64, b.build_iconst_i64(1));
-            BValue* in_bounds = b.build_ult(zero_idx, cap_i64);
-
-            BasicBlock* fast_st_bb = st.newBlock("arr_st_fast");
-            BasicBlock* slow_st_bb = st.newBlock("arr_st_slow");
-            BasicBlock* merge_bb = st.newBlock("arr_st_merge");
-
-            if (rhs.rep == Rep::Float64) {
-                b.build_br_if(in_bounds, fast_st_bb, slow_st_bb);
-
-                b.position_at_end(fast_st_bb);
-                BValue* arr_ptr = b.build_load(Type::ptr(), tbl_ptr, static_cast<int32_t>(offsetof(LuaTable, array_data)));
-                b.build_store_indexed(Type::f64(), arr_ptr, zero_idx, 8, rhs.val);
-                b.build_br(merge_bb);
-
-                b.position_at_end(slow_st_bb);
-                BValue* val_bits = emitBox(st, rhs);
-                b.build_call("brasslua_rt_table_set_int", Type::i64(), {tbl_bits, idx_i64, val_bits});
-                b.build_br(merge_bb);
-
-                b.position_at_end(merge_bb);
-                return;
-            }
-
-            BValue* val_bits = nullptr;
-            if (rhs.rep == Rep::Int64) {
-                if (rhs.val && rhs.val->is_instruction() &&
-                    rhs.val->defining_instruction()->opcode() == brass::Opcode::iconst_i64 &&
-                    Value::fitsInlineInt(rhs.val->defining_instruction()->imm_i64())) {
-                    int64_t imm = rhs.val->defining_instruction()->imm_i64();
-                    uint64_t bits = (static_cast<uint64_t>(Tag::Int47) << kTagShift) |
-                                    (static_cast<uint64_t>(imm) & kPayloadMask);
-                    val_bits = b.build_iconst_i64(static_cast<int64_t>(bits));
-                } else {
-                    BValue* tag_bits = b.build_iconst_i64(
-                        static_cast<int64_t>(static_cast<uint64_t>(Tag::Int47) << kTagShift));
-                    val_bits = b.build_or(tag_bits, b.build_and(rhs.val, payload_mask));
-                }
-            } else {
-                val_bits = emitBox(st, rhs);
-            }
-
-            b.build_br_if(in_bounds, fast_st_bb, slow_st_bb);
-
-            b.position_at_end(fast_st_bb);
-            BValue* arr_ptr = b.build_load(Type::ptr(), tbl_ptr, static_cast<int32_t>(offsetof(LuaTable, array_data)));
-            b.build_store_indexed(Type::i64(), arr_ptr, zero_idx, 8, val_bits);
-            b.build_br(merge_bb);
-
-            b.position_at_end(slow_st_bb);
-            b.build_call("brasslua_rt_table_set_int", Type::i64(), {tbl_bits, idx_i64, val_bits});
-            b.build_br(merge_bb);
-
-            b.position_at_end(merge_bb);
-            return;
-        }
-
-        BValue* val_bits = emitBox(st, rhs);
+    BValue* val_bits = emitBox(st, rhs);
+    BasicBlock* key_any_bb = nullptr;
+    BValue* key_bits = key_mv.rep == Rep::Boxed ? key_mv.val : nullptr;
+    BValue* bet_idx = emitIntKeyBet(*this, st, *idx_expr.index, key_mv, key_bits, key_any_bb);
+    if (bet_idx || key_mv.rep == Rep::Int64 || idx_expr.index->inferred_type == InferredType::Int64) {
+        BValue* idx_i64 = bet_idx ? bet_idx : emitUnboxInt64(st, key_mv);
         BValue* tag = b.build_lshr(tbl_bits, b.build_iconst_i64(48));
         BValue* is_tbl = b.build_eq(tag, b.build_iconst_i64(static_cast<int64_t>(Tag::Object)));
 
@@ -197,11 +135,17 @@ void MirModuleLowerer::lowerIndexStore(FunctionBuildState& st, const IndexExpr& 
         b.build_br(merge_bb);
 
         b.position_at_end(merge_bb);
+        if (!key_any_bb) return;
+        BasicBlock* done_bb = st.newBlock("key_merge");
+        b.build_br(done_bb);
+        b.position_at_end(key_any_bb);
+        b.build_call("brasslua_rt_table_set", Type::i64(), {tbl_bits, key_bits, val_bits});
+        b.build_br(done_bb);
+        b.position_at_end(done_bb);
         return;
     }
 
-    BValue* val_bits = emitBox(st, rhs);
-    BValue* key_bits = emitBox(st, key_mv);
+    if (!key_bits) key_bits = emitBox(st, key_mv);
     b.build_call("brasslua_rt_table_set", Type::i64(), {tbl_bits, key_bits, val_bits});
 }
 
@@ -211,16 +155,14 @@ BValue* MirModuleLowerer::emitStringConst(FunctionBuildState& st, uint32_t inter
     return st.builder.build_iconst_i64(static_cast<int64_t>(Value::fromString(s).rawBits()));
 }
 
-MirValue MirModuleLowerer::lowerFieldLoad(FunctionBuildState& st, const FieldExpr& fld_expr,
-                                          InferredType /*inferred_type*/) {
+MirValue MirModuleLowerer::lowerFieldLoad(FunctionBuildState& st, const FieldExpr& fld_expr) {
     MirValue tbl_mv = lowerExpr(st, *fld_expr.table);
     BValue* tbl_bits = emitBox(st, tbl_mv);
     uint32_t id = fld_expr.intern_id != 0 ? fld_expr.intern_id : rt_.internString(fld_expr.field);
     return MirValue{emitFieldGet(st, tbl_bits, id), Rep::Boxed};
 }
 
-void MirModuleLowerer::lowerFieldStore(FunctionBuildState& st, const FieldExpr& fld_expr, MirValue rhs,
-                                       InferredType /*target_type*/) {
+void MirModuleLowerer::lowerFieldStore(FunctionBuildState& st, const FieldExpr& fld_expr, MirValue rhs) {
     MirValue tbl_mv = lowerExpr(st, *fld_expr.table);
     BValue* tbl_bits = emitBox(st, tbl_mv);
     uint32_t id = fld_expr.intern_id != 0 ? fld_expr.intern_id : rt_.internString(fld_expr.field);

@@ -56,12 +56,105 @@ void populateClosureUpvalues(MirModuleLowerer& lowerer, FunctionBuildState& st,
 // integers (integer ops other than `/`), or two numbers of which one is a
 // float, are done here; anything else (a big or boxed integer result, strings,
 // metamethods) calls `rt_fn`, the runtime's whole operator. Arithmetic gives a
-// boxed result, a comparison a BoolBit.
-MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, BinOp op,
-                            BValue* la, BValue* rb, const char* rt_fn) {
+// boxed result, a comparison a BoolBit. The operands' hints make a site a
+// bet: two integers' (not for `/`), or a float operation's, each operand
+// checked as its hint says ahead of the generic code.
+// The float operation of `op` on two doubles: a BoolBit for a comparison,
+// else the boxed result.
+BValue* emitFloatOp(MirModuleLowerer& lowerer, FunctionBuildState& st, BinOp op, BValue* lf, BValue* rf) {
     auto& b = st.builder;
-    const bool is_cmp = op == BinOp::Lt || op == BinOp::Le || op == BinOp::Gt || op == BinOp::Ge;
+    switch (op) {
+        case BinOp::Lt: return b.build_slt(lf, rf);
+        case BinOp::Le: return b.build_sle(lf, rf);
+        case BinOp::Gt: return b.build_sgt(lf, rf);
+        case BinOp::Ge: return b.build_sge(lf, rf);
+        case BinOp::Eq: return b.build_eq(lf, rf);
+        case BinOp::Ne: return b.build_ne(lf, rf);
+        default: break;
+    }
+    BValue* r = op == BinOp::Add ? b.build_add(lf, rf)
+              : op == BinOp::Sub ? b.build_sub(lf, rf)
+              : op == BinOp::Mul ? b.build_mul(lf, rf)
+                                 : b.build_sdiv(lf, rf);
+    return lowerer.emitBox(st, MirValue{r, Rep::Float64});
+}
+
+// One operand of a bet on a float operation, as a double: an unboxed number
+// as it is, a boxed one as its hint says it is (a double, an inline integer,
+// either), with `ok` the check that it is (null when nothing is to check).
+// `dbl` says the operand is surely a double once checked. False when the
+// hint bets on no number, or an unboxed integer is not exactly a double for
+// a comparison.
+bool betFloatOperand(FunctionBuildState& st, MirValue v, BValue* bits, InferredType hint, bool is_cmp,
+                     BValue*& f, BValue*& ok, bool& dbl) {
+    auto& b = st.builder;
+    ok = nullptr;
+    dbl = false;
+    if (v.rep == Rep::Float64) {
+        f = v.val;
+        dbl = true;
+        return true;
+    }
+    if (v.rep == Rep::Int64) {
+        if (is_cmp) return false;
+        f = b.build_sitofp_f64_i64(v.val);
+        return true;
+    }
+    if (v.rep != Rep::Boxed) return false;
+    BValue* max_num = b.build_iconst_i64(static_cast<int64_t>(kNumberMaxBits));
+    BValue* c16 = b.build_iconst_i64(16);
+    BValue* as_int = b.build_sitofp_f64_i64(b.build_ashr(b.build_shl(bits, c16), c16));
+    BValue* is_int = b.build_eq(b.build_lshr(bits, b.build_iconst_i64(48)),
+                                b.build_iconst_i64(static_cast<int64_t>(Tag::Int47)));
+    switch (hint) {
+        case InferredType::Float64:
+            ok = b.build_ule(bits, max_num);
+            f = b.build_bitcast_f64_i64(bits);
+            dbl = true;
+            return true;
+        case InferredType::Int64:
+            ok = is_int;
+            f = as_int;
+            return true;
+        case InferredType::Number:
+            ok = b.build_or(b.build_ule(bits, max_num), is_int);
+            f = b.build_select(is_int, as_int, b.build_bitcast_f64_i64(bits));
+            return true;
+        default:
+            return false;
+    }
+}
+
+MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, BinOp op,
+                            MirValue lhs, MirValue rhs, const char* rt_fn,
+                            InferredType lhint = InferredType::Any, InferredType rhint = InferredType::Any) {
+    auto& b = st.builder;
+    const bool is_cmp = op == BinOp::Lt || op == BinOp::Le || op == BinOp::Gt || op == BinOp::Ge ||
+                        op == BinOp::Eq || op == BinOp::Ne;
     Type res_ty = is_cmp ? Type::i32() : Type::i64();
+    BValue* la = lowerer.emitBox(st, lhs);
+    BValue* rb = lowerer.emitBox(st, rhs);
+    BasicBlock* merge_bb = st.newBlock("dyn_merge", {res_ty});
+
+    const bool bet_int = op != BinOp::Div && lhint == InferredType::Int64 && rhint == InferredType::Int64;
+    if (!bet_int) {
+        // A bet on a float operation: each operand checked as its hint says,
+        // the operation done straight (not on two integers, unless `/`).
+        BValue *lf = nullptr, *rf = nullptr, *l_ok = nullptr, *r_ok = nullptr;
+        bool l_dbl = false, r_dbl = false;
+        if (betFloatOperand(st, lhs, la, lhint, is_cmp, lf, l_ok, l_dbl) &&
+            betFloatOperand(st, rhs, rb, rhint, is_cmp, rf, r_ok, r_dbl) &&
+            (op == BinOp::Div || l_dbl || r_dbl) && (l_ok || r_ok)) {
+            BValue* hit = l_ok && r_ok ? b.build_and(l_ok, r_ok) : l_ok ? l_ok : r_ok;
+            BasicBlock* fast_bb = st.newBlock("dyn_bet");
+            BasicBlock* generic_bb = st.newBlock("dyn_generic");
+            lowerer.emitSite(st, hit, fast_bb, generic_bb, true);
+            b.position_at_end(fast_bb);
+            b.build_br(merge_bb, {emitFloatOp(lowerer, st, op, lf, rf)});
+            b.position_at_end(generic_bb);
+        }
+    }
+
     BValue* c48 = b.build_iconst_i64(48);
     BValue* c16 = b.build_iconst_i64(16);
     BValue* int_tag = b.build_iconst_i64(static_cast<int64_t>(Tag::Int47));
@@ -72,8 +165,11 @@ MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, B
     BasicBlock* chk_num_bb = st.newBlock("dyn_chk_num");
     BasicBlock* flt_bb = st.newBlock("dyn_flt");
     BasicBlock* slow_bb = st.newBlock("dyn_slow");
-    BasicBlock* merge_bb = st.newBlock("dyn_merge", {res_ty});
-    b.build_br_if(b.build_and(l_int, r_int), op == BinOp::Div ? chk_num_bb : int_bb, chk_num_bb);
+    if (op == BinOp::Div) {
+        b.build_br(chk_num_bb);
+    } else {
+        lowerer.emitSite(st, b.build_and(l_int, r_int), int_bb, chk_num_bb, bet_int);
+    }
 
     // Two inline integers.
     b.position_at_end(int_bb);
@@ -85,6 +181,8 @@ MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, B
             case BinOp::Lt: r = b.build_slt(li, ri); break;
             case BinOp::Le: r = b.build_sle(li, ri); break;
             case BinOp::Gt: r = b.build_sgt(li, ri); break;
+            case BinOp::Eq: r = b.build_eq(la, rb); break;
+            case BinOp::Ne: r = b.build_ne(la, rb); break;
             default:        r = b.build_sge(li, ri); break;
         }
         b.build_br(merge_bb, {r});
@@ -115,22 +213,7 @@ MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, B
                                 b.build_bitcast_f64_i64(la));
     BValue* rf = b.build_select(r_int, b.build_sitofp_f64_i64(b.build_ashr(b.build_shl(rb, c16), c16)),
                                 b.build_bitcast_f64_i64(rb));
-    if (is_cmp) {
-        BValue* r = nullptr;
-        switch (op) {
-            case BinOp::Lt: r = b.build_slt(lf, rf); break;
-            case BinOp::Le: r = b.build_sle(lf, rf); break;
-            case BinOp::Gt: r = b.build_sgt(lf, rf); break;
-            default:        r = b.build_sge(lf, rf); break;
-        }
-        b.build_br(merge_bb, {r});
-    } else {
-        BValue* r = op == BinOp::Add ? b.build_add(lf, rf)
-                  : op == BinOp::Sub ? b.build_sub(lf, rf)
-                  : op == BinOp::Mul ? b.build_mul(lf, rf)
-                                     : b.build_sdiv(lf, rf);
-        b.build_br(merge_bb, {lowerer.emitBox(st, MirValue{r, Rep::Float64})});
-    }
+    b.build_br(merge_bb, {emitFloatOp(lowerer, st, op, lf, rf)});
 
     b.position_at_end(slow_bb);
     BValue* slow = nullptr;
@@ -138,7 +221,7 @@ MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, B
         // a > b is b < a, a >= b is b <= a.
         const bool swap = op == BinOp::Gt || op == BinOp::Ge;
         BValue* r = b.build_call(rt_fn, Type::i32(), {swap ? rb : la, swap ? la : rb});
-        slow = b.build_ne(r, b.build_iconst_i32(0));
+        slow = op == BinOp::Ne ? b.build_eq(r, b.build_iconst_i32(0)) : b.build_ne(r, b.build_iconst_i32(0));
     } else {
         slow = b.build_call(rt_fn, Type::i64(), {la, rb});
     }
@@ -250,14 +333,20 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
     // Comparisons
     bool both_int64 = (lhs.rep == Rep::Int64 || bin.lhs->inferred_type == InferredType::Int64) &&
                       (rhs.rep == Rep::Int64 || bin.rhs->inferred_type == InferredType::Int64);
-    bool lhs_known_num = (lhs.rep != Rep::Boxed) ||
-                         (bin.lhs->inferred_type == InferredType::Int64 ||
-                          bin.lhs->inferred_type == InferredType::Float64 ||
-                          bin.lhs->inferred_type == InferredType::Number);
-    bool rhs_known_num = (rhs.rep != Rep::Boxed) ||
-                         (bin.rhs->inferred_type == InferredType::Int64 ||
-                          bin.rhs->inferred_type == InferredType::Float64 ||
-                          bin.rhs->inferred_type == InferredType::Number);
+    // Lua compares an integer with a float exactly, so the doubles' compare
+    // is for two doubles: a float, or an integer constant a double holds.
+    auto exact_double = [](MirValue v, const Expr& e) {
+        if (v.rep == Rep::Float64) return true;
+        if (v.rep == Rep::Boxed) return e.inferred_type == InferredType::Float64;
+        if (v.rep != Rep::Int64 || !v.val || !v.val->is_instruction() ||
+            v.val->defining_instruction()->opcode() != brass::Opcode::iconst_i64) {
+            return false;
+        }
+        const int64_t c = v.val->defining_instruction()->imm_i64();
+        return c >= -(int64_t{1} << 53) && c <= (int64_t{1} << 53);
+    };
+    const bool lhs_known_num = exact_double(lhs, *bin.lhs);
+    const bool rhs_known_num = exact_double(rhs, *bin.rhs);
 
     if (bin.op == BinOp::Eq || bin.op == BinOp::Ne ||
         bin.op == BinOp::Lt || bin.op == BinOp::Le ||
@@ -288,23 +377,19 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
                 default: break;
             }
         } else {
-            BValue* la = emitBox(st, lhs);
-            BValue* rb = emitBox(st, rhs);
-            BValue* r_i32 = nullptr;
             switch (bin.op) {
                 case BinOp::Eq:
                 case BinOp::Ne:
-                    r_i32 = b.build_call("brasslua_rt_eq", Type::i32(), {la, rb});
-                    bit_res = (bin.op == BinOp::Eq)
-                                  ? b.build_ne(r_i32, b.build_iconst_i32(0))
-                                  : b.build_eq(r_i32, b.build_iconst_i32(0));
-                    break;
+                    return emitDynamicNumeric(*this, st, bin.op, lhs, rhs, "brasslua_rt_eq", bin.lhs->hint,
+                                              bin.rhs->hint);
                 case BinOp::Lt:
                 case BinOp::Gt:
-                    return emitDynamicNumeric(*this, st, bin.op, la, rb, "brasslua_rt_lt");
+                    return emitDynamicNumeric(*this, st, bin.op, lhs, rhs, "brasslua_rt_lt", bin.lhs->hint,
+                                              bin.rhs->hint);
                 case BinOp::Le:
                 case BinOp::Ge:
-                    return emitDynamicNumeric(*this, st, bin.op, la, rb, "brasslua_rt_le");
+                    return emitDynamicNumeric(*this, st, bin.op, lhs, rhs, "brasslua_rt_le", bin.lhs->hint,
+                                              bin.rhs->hint);
                 default:
                     break;
             }
@@ -344,9 +429,15 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
     auto known_float = [](const MirValue& v, const Expr& e) {
         return v.rep == Rep::Float64 || (v.rep == Rep::Boxed && e.inferred_type == InferredType::Float64);
     };
+    auto known_number = [](const MirValue& v, const Expr& e) {
+        return v.rep == Rep::Float64 || v.rep == Rep::Int64 ||
+               (v.rep == Rep::Boxed && (e.inferred_type == InferredType::Int64 ||
+                                        e.inferred_type == InferredType::Float64 ||
+                                        e.inferred_type == InferredType::Number));
+    };
     const bool float_result = bin.op == BinOp::Div || bin.op == BinOp::Pow ||
                               known_float(lhs, *bin.lhs) || known_float(rhs, *bin.rhs);
-    if (lhs_known_num && rhs_known_num && float_result) {
+    if (known_number(lhs, *bin.lhs) && known_number(rhs, *bin.rhs) && float_result) {
         BValue* lf = emitUnboxFloat64(st, lhs);
         BValue* rf = emitUnboxFloat64(st, rhs);
         switch (bin.op) {
@@ -368,8 +459,6 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
     }
 
     // Dynamic boxed arithmetic (preserves integer vs float subtype and metamethods!)
-    BValue* la = emitBox(st, lhs);
-    BValue* rb = emitBox(st, rhs);
     const char* rt_fn = "brasslua_rt_add";
     switch (bin.op) {
         case BinOp::Add:  rt_fn = "brasslua_rt_add"; break;
@@ -383,8 +472,10 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
     }
     (void)result_type;
     if (bin.op == BinOp::Add || bin.op == BinOp::Sub || bin.op == BinOp::Mul || bin.op == BinOp::Div) {
-        return emitDynamicNumeric(*this, st, bin.op, la, rb, rt_fn);
+        return emitDynamicNumeric(*this, st, bin.op, lhs, rhs, rt_fn, bin.lhs->hint, bin.rhs->hint);
     }
+    BValue* la = emitBox(st, lhs);
+    BValue* rb = emitBox(st, rhs);
     return MirValue{b.build_call(rt_fn, Type::i64(), {la, rb}), Rep::Boxed};
 }
 
@@ -721,25 +812,9 @@ MirValue MirModuleLowerer::lowerExpr(FunctionBuildState& st, const Expr& expr) {
             } else if constexpr (std::is_same_v<T, TableExpr>) {
                 return lowerTableExpr(st, e);
             } else if constexpr (std::is_same_v<T, IndexExpr>) {
-                // A table holds whatever was stored, so the inferred type is
-                // only the likely case: the unbox checks the tag.
-                MirValue mv = lowerIndexLoad(st, e, expr.inferred_type);
-                if (expr.inferred_type == InferredType::Float64 && mv.rep == Rep::Boxed) {
-                    return MirValue{emitUnboxFloat64(st, mv), Rep::Float64};
-                }
-                if (expr.inferred_type == InferredType::Int64 && mv.rep == Rep::Boxed) {
-                    return MirValue{emitUnboxInt64(st, mv), Rep::Int64};
-                }
-                return mv;
+                return lowerIndexLoad(st, e);
             } else if constexpr (std::is_same_v<T, FieldExpr>) {
-                MirValue mv = lowerFieldLoad(st, e, expr.inferred_type);
-                if (expr.inferred_type == InferredType::Float64 && mv.rep == Rep::Boxed) {
-                    return MirValue{emitUnboxFloat64(st, mv), Rep::Float64};
-                }
-                if (expr.inferred_type == InferredType::Int64 && mv.rep == Rep::Boxed) {
-                    return MirValue{emitUnboxInt64(st, mv), Rep::Int64};
-                }
-                return mv;
+                return lowerFieldLoad(st, e);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 return lowerCallExpr(st, e, expr.inferred_type);
             } else if constexpr (std::is_same_v<T, MethodCallExpr>) {

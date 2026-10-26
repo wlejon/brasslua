@@ -151,7 +151,9 @@ void MirModuleLowerer::lowerNumericFor(FunctionBuildState& st, const NumericForS
     auto lowerBody = [&](Rep rep, MirValue var) {
         st.loops.push_back(LoopContext{end_bb});
         pushScope(st);
-        defineLocal(st, s.var_symbol_id, rep, s.var_is_captured);
+        // A body that assigns the variable something else boxes it.
+        const Rep var_rep = repForInferredType(s.var_type) == rep ? rep : Rep::Boxed;
+        defineLocal(st, s.var_symbol_id, var_rep, s.var_is_captured);
         storeVar(st, s.var_symbol_id, s.var_name, 0, var);
         lowerBlockStmts(st, s.body);
         popScope(st);

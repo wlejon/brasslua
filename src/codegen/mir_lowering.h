@@ -1,6 +1,7 @@
 #pragma once
 
 #include "brasslua/runtime.h"
+#include "codegen/speculation.h"
 
 #include <brass/mir/block.hpp>
 #include <brass/mir/builder.hpp>
@@ -170,14 +171,12 @@ public:
     MirValue lowerCallExpr(FunctionBuildState& st, const CallExpr& call, InferredType result_type);
     MirValue lowerMethodCallExpr(FunctionBuildState& st, const MethodCallExpr& mcall);
     MirValue lowerTableExpr(FunctionBuildState& st, const TableExpr& tbl_expr);
-    MirValue lowerIndexLoad(FunctionBuildState& st, const IndexExpr& idx_expr,
-                            InferredType inferred_type = InferredType::Any);
-    void lowerIndexStore(FunctionBuildState& st, const IndexExpr& idx_expr, MirValue rhs,
-                         InferredType target_type = InferredType::Any);
-    MirValue lowerFieldLoad(FunctionBuildState& st, const FieldExpr& fld_expr,
-                            InferredType inferred_type = InferredType::Any);
-    void lowerFieldStore(FunctionBuildState& st, const FieldExpr& fld_expr, MirValue rhs,
-                         InferredType target_type = InferredType::Any);
+    // A table element or field may hold anything (the hints bet on a key
+    // being an integer, not on what is stored).
+    MirValue lowerIndexLoad(FunctionBuildState& st, const IndexExpr& idx_expr);
+    void lowerIndexStore(FunctionBuildState& st, const IndexExpr& idx_expr, MirValue rhs);
+    MirValue lowerFieldLoad(FunctionBuildState& st, const FieldExpr& fld_expr);
+    void lowerFieldStore(FunctionBuildState& st, const FieldExpr& fld_expr, MirValue rhs);
 
     // Field access at a constant string key (mir_lowering_table.cpp). The
     // key is an interned string: its Value bits are a constant of the
@@ -200,6 +199,14 @@ public:
     CompiledFuncSig compileFuncBody(FunctionBuildState* parent_st, const std::string& debug_name,
                                     uint32_t func_symbol_id, const FuncBody& fbody, bool has_implicit_self);
 
+    // A speculation site (codegen/speculation.h): ends the block with
+    // `br_if hit, fast, slow`, slow the generic code. A bet when the hints
+    // say hit is the likely case.
+    void emitSite(FunctionBuildState& st, brass::Value* hit, brass::BasicBlock* fast, brass::BasicBlock* slow,
+                  bool bet);
+    // The bets of every function lowered, for ChunkSpeculation::arm.
+    std::vector<ChunkSpeculation::Bets> takeBets();
+
     RuntimeState& rt() noexcept { return rt_; }
     brass::Module& mod() noexcept { return mod_; }
     const std::unordered_map<std::string, CompiledFuncSig>& knownFunctions() const noexcept {
@@ -216,6 +223,7 @@ private:
     brass::Module& mod_;
     uint32_t next_fn_id_ = 1;
     std::unordered_map<std::string, CompiledFuncSig> known_functions_;
+    std::vector<ChunkSpeculation::Bets> bets_;
 };
 
 } // namespace brasslua

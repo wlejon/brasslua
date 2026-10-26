@@ -338,6 +338,27 @@ MirValue MirModuleLowerer::loadVar(FunctionBuildState& st, uint32_t symbol_id,
     return MirValue{merge_bb->param(0), Rep::Boxed};
 }
 
+void MirModuleLowerer::emitSite(FunctionBuildState& st, BValue* hit, BasicBlock* fast, BasicBlock* slow, bool bet) {
+    brass::Instruction* br = st.builder.build_br_if(hit, fast, slow);
+    if (!bet) return;
+    if (bets_.empty() || bets_.back().fn != st.fn) bets_.push_back({st.fn, {}});
+    bets_.back().branches.push_back(br);
+}
+
+std::vector<ChunkSpeculation::Bets> MirModuleLowerer::takeBets() {
+    // A function's sites may be interleaved with a nested function's.
+    std::vector<ChunkSpeculation::Bets> merged;
+    std::unordered_map<brass::Function*, size_t> index;
+    for (auto& fb : bets_) {
+        auto [it, fresh] = index.emplace(fb.fn, merged.size());
+        if (fresh) merged.push_back({fb.fn, {}});
+        auto& dst = merged[it->second].branches;
+        dst.insert(dst.end(), fb.branches.begin(), fb.branches.end());
+    }
+    bets_.clear();
+    return merged;
+}
+
 BValue* MirModuleLowerer::emitEnvConst(FunctionBuildState& st) {
     return st.builder.build_iconst_i64(static_cast<int64_t>(Value::fromTable(rt_.envTable()).rawBits()));
 }

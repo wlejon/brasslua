@@ -171,7 +171,11 @@ struct Expr {
 
     Variant node;
     SourceLoc loc;
+    // What the value is (the sound run, type_infer.cpp), which the code
+    // relies on; `hint` what it likely is (the hinted run), which the
+    // speculative code bets on behind a guard.
     InferredType inferred_type = InferredType::Unknown;
+    InferredType hint = InferredType::Unknown;
     // Written in parentheses: a call or `...` gives its first value only.
     bool parenthesized = false;
 
@@ -240,6 +244,8 @@ struct NumericForStmt {
     // are not known until the loop starts.
     enum class Mode : uint8_t { Int, Float, Dynamic };
     Mode mode = Mode::Dynamic;
+    // The loop variable's: the mode's, or wider when the body assigns it.
+    InferredType var_type = InferredType::Any;
     uint32_t var_symbol_id = 0;
     bool var_is_captured = false;
 };
