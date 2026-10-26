@@ -93,6 +93,14 @@ struct FunctionBuildState {
         return bb;
     }
 
+    // A slow path (the runtime's call, a bet lost): brass's inliner does not
+    // weigh it in this function's size.
+    brass::BasicBlock* newColdBlock(std::string_view name) {
+        brass::BasicBlock* bb = newBlock(name);
+        bb->set_cold();
+        return bb;
+    }
+
     brass::BasicBlock* newBlock(std::string_view name, std::initializer_list<brass::Type> param_types) {
         brass::BasicBlock* bb = builder.create_block(name);
         fn->append_block(bb);
@@ -166,6 +174,10 @@ public:
     // last of a multiple assignment's values, a generic for's iterator, a
     // returned call): a call made without the buffer leaves its value there.
     MirValue lowerMultiExpr(FunctionBuildState& st, const Expr& expr);
+    // A call of a closure that is likely `symbol`'s: the compiled function
+    // called by name when the closure's entry is it, else as any other.
+    brass::Value* emitTargetCall(FunctionBuildState& st, const std::string& symbol, brass::Value* callee_bits,
+                                 brass::Value* arg_buf, brass::Value* nargs_v, bool want_multi);
     // Sets the multiret state to this one value, as a call's return would.
     void emitSetSingleRet(FunctionBuildState& st, brass::Value* boxed);
     MirValue lowerBinaryExpr(FunctionBuildState& st, const BinaryExpr& bin, InferredType result_type);

@@ -9,7 +9,6 @@
 #include <brass/mir/osr_entry.hpp>
 #include <brass/mir/pass_pipeline.hpp>
 #include <brass/mir/sroa.hpp>
-#include <brass/runtime/deopt.hpp>
 
 #include <cstring>
 #include <stdexcept>
@@ -23,6 +22,7 @@ using brass::Instruction;
 using brass::Opcode;
 
 struct ChunkSpeculation::Armed {
+    ChunkSpeculation* owner = nullptr;
     std::string name;
     brass::Type return_type;
     // Per guard (by resume id): the id of the site's slow block, which the
@@ -38,9 +38,11 @@ struct ChunkSpeculation::Armed {
 };
 
 ChunkSpeculation::ChunkSpeculation() = default;
+ChunkSpeculation::~ChunkSpeculation() = default;
 
-ChunkSpeculation::~ChunkSpeculation() {
-    for (void* entry : resumer_entries_) brass::runtime::unregister_deopt_resumer(entry);
+extern "C" uint64_t brasslua_rt_resume(void* armed, uint32_t resume_id, const uint64_t* state) {
+    auto* a = static_cast<ChunkSpeculation::Armed*>(armed);
+    return a->owner->resume(*a, resume_id, state);
 }
 
 void ChunkSpeculation::arm(brass::Module& mod, const std::vector<Bets>& bets) {
@@ -55,7 +57,10 @@ void ChunkSpeculation::arm(brass::Module& mod, const std::vector<Bets>& bets) {
     for (const Bets& fb : bets) {
         if (fb.branches.empty()) continue;
         Function& fn = *fb.fn;
+        // A continuation's result is passed back as bits.
+        if (fn.return_type() != brass::Type::i64() && fn.return_type() != brass::Type::f64()) continue;
         auto armed = std::make_unique<Armed>();
+        armed->owner = this;
         armed->name = std::string(fn.name());
         armed->return_type = fn.return_type();
         // Every site's state first, from the body as the generic copy has it.
@@ -90,31 +95,46 @@ void ChunkSpeculation::arm(brass::Module& mod, const std::vector<Bets>& bets) {
             b.position_at_end(bb);
             Instruction* guard = b.build_guard(
                 hit, "", brass::Span<brass::Value* const>(p.state.data(), p.state.size()));
+            const uint32_t resume_id = guard->resume_id();
+            const std::string stub = armed->name + "_exit" + std::to_string(resume_id);
+            guard->set_symbol(mod.string_pool().intern(stub));
+            buildExitStub(mod, *armed, stub, resume_id, p.state);
             b.build_br(fast.block, brass::Span<brass::Value* const>(fast.args.data(), fast.args.size()));
-            armed->slow_block[guard->resume_id()] = slow->id();
+            armed->slow_block[resume_id] = slow->id();
         }
         fn.rebuild_cfg_predecessors();
         if (!armed->slow_block.empty()) armed_.push_back(std::move(armed));
     }
 }
 
-void ChunkSpeculation::install(brass::codegen::JitExecutionEngine& engine) {
-    engine_ = &engine;
-    for (auto& armed : armed_) {
-        void* entry = engine.get_symbol_address(armed->name);
-        if (!entry) continue;
-        Armed* a = armed.get();
-        brass::runtime::register_deopt_resumer(
-            entry, [this, a](const brass::runtime::DeoptFrame& frame) { return resume(*a, frame); });
-        resumer_entries_.push_back(entry);
-    }
+void ChunkSpeculation::buildExitStub(brass::Module& mod, Armed& armed, const std::string& name,
+                                     uint32_t resume_id, const std::vector<brass::Value*>& state) {
+    // stub(state...): the state in a buffer, one word each, resumed by the
+    // runtime; its result is the function's.
+    std::vector<brass::Type> params;
+    for (brass::Value* v : state) params.push_back(v->type());
+    Function* stub = mod.create_function(name, armed.return_type, brass::Span<const brass::Type>(params));
+    brass::Builder b(*stub);
+    b.append_block("entry");
+    std::vector<brass::Value*> args;
+    for (size_t i = 0; i < params.size(); ++i) args.push_back(b.add_param(params[i]));
+    brass::Value* buf = b.build_alloca(static_cast<uint32_t>(std::max<size_t>(params.size(), 1) * 8), 8);
+    for (size_t i = 0; i < args.size(); ++i) b.build_store(params[i], buf, static_cast<int32_t>(i * 8), args[i]);
+    brass::Value* bits = b.build_call(
+        "brasslua_rt_resume", brass::Type::i64(),
+        {b.build_iconst_i64(reinterpret_cast<intptr_t>(&armed)), b.build_iconst_i32(static_cast<int32_t>(resume_id)), buf});
+    b.build_ret(armed.return_type.is_float() ? b.build_bitcast_f64_i64(bits) : bits);
 }
 
-uint64_t ChunkSpeculation::resume(Armed& armed, const brass::runtime::DeoptFrame& frame) {
-    auto it = armed.continuations.find(frame.resume_id);
+void ChunkSpeculation::install(brass::codegen::JitExecutionEngine& engine) {
+    engine_ = &engine;
+}
+
+uint64_t ChunkSpeculation::resume(Armed& armed, uint32_t resume_id, const uint64_t* state) {
+    auto it = armed.continuations.find(resume_id);
     if (it == armed.continuations.end()) {
-        buildContinuation(armed, frame.resume_id);
-        it = armed.continuations.find(frame.resume_id);
+        buildContinuation(armed, resume_id);
+        it = armed.continuations.find(resume_id);
     }
     const Armed::Continuation& cont = it->second;
     // Live-in i of the continuation is buffer[i]; the guard's state holds
@@ -122,7 +142,7 @@ uint64_t ChunkSpeculation::resume(Armed& armed, const brass::runtime::DeoptFrame
     std::vector<uint64_t> buffer(cont.rematerialized.size(), 0);
     size_t j = 0;
     for (size_t i = 0; i < buffer.size(); ++i) {
-        if (!cont.rematerialized[i]) buffer[i] = frame.slots[j++];
+        if (!cont.rematerialized[i]) buffer[i] = state[j++];
     }
     if (armed.return_type.is_float()) {
         double r = reinterpret_cast<double (*)(uint64_t*)>(cont.entry)(buffer.data());

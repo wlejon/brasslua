@@ -134,7 +134,7 @@ MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, B
             (op == BinOp::Div || l_dbl || r_dbl) && (l_ok || r_ok)) {
             BValue* hit = l_ok && r_ok ? b.build_and(l_ok, r_ok) : l_ok ? l_ok : r_ok;
             BasicBlock* fast_bb = st.newBlock("dyn_bet");
-            BasicBlock* generic_bb = st.newBlock("dyn_generic");
+            BasicBlock* generic_bb = st.newColdBlock("dyn_generic");
             lowerer.emitSite(st, hit, fast_bb, generic_bb, true);
             b.position_at_end(fast_bb);
             b.build_br(merge_bb, {emitFloatOp(lowerer, st, op, lf, rf)});
@@ -151,7 +151,7 @@ MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, B
     BasicBlock* int_bb = st.newBlock("dyn_int");
     BasicBlock* chk_num_bb = st.newBlock("dyn_chk_num");
     BasicBlock* flt_bb = st.newBlock("dyn_flt");
-    BasicBlock* slow_bb = st.newBlock("dyn_slow");
+    BasicBlock* slow_bb = st.newColdBlock("dyn_slow");
     if (op == BinOp::Div) {
         b.build_br(chk_num_bb);
     } else {
@@ -226,7 +226,7 @@ BValue* emitClosureCall(FunctionBuildState& st, BValue* callee_bits, BValue* arg
     BValue* tag = b.build_lshr(callee_bits, b.build_iconst_i64(48));
     BValue* is_fn = b.build_eq(tag, b.build_iconst_i64(static_cast<int64_t>(Tag::Function)));
     BasicBlock* fn_bb = st.newBlock("ccall_fn");
-    BasicBlock* slow_bb = st.newBlock("ccall_slow");
+    BasicBlock* slow_bb = st.newColdBlock("ccall_slow");
     BasicBlock* merge_bb = st.newBlock("ccall_merge", {Type::i64()});
     b.build_br_if(is_fn, fn_bb, slow_bb);
 
@@ -530,6 +530,48 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
     return MirValue{b.build_call(rt_fn, Type::i64(), {la, rb}), Rep::Boxed};
 }
 
+BValue* MirModuleLowerer::emitTargetCall(FunctionBuildState& st, const std::string& symbol, BValue* callee_bits,
+                                         BValue* arg_buf, BValue* nargs_v, bool want_multi) {
+    auto& b = st.builder;
+    BasicBlock* chk_bb = st.newBlock("tcall_chk");
+    BasicBlock* direct_bb = st.newBlock("tcall_direct");
+    BasicBlock* other_bb = st.newColdBlock("tcall_other");
+    BasicBlock* merge_bb = st.newBlock("tcall_merge", {Type::i64()});
+    BValue* is_fn = b.build_eq(b.build_lshr(callee_bits, b.build_iconst_i64(48)),
+                               b.build_iconst_i64(static_cast<int64_t>(Tag::Function)));
+    b.build_br_if(is_fn, chk_bb, other_bb);
+
+    b.position_at_end(chk_bb);
+    BValue* cl = b.build_and(callee_bits, b.build_iconst_i64(static_cast<int64_t>(kPayloadMask)));
+    BValue* entry = b.build_load(Type::ptr(), cl, static_cast<int32_t>(offsetof(LuaClosure, fn)));
+    b.build_br_if(b.build_eq(entry, b.build_func_addr(symbol)), direct_bb, other_bb);
+
+    // The function's compiled entry called by name, which the inliner sees.
+    b.position_at_end(direct_bb);
+    BValue* mode_slot = b.build_iconst_i64(reinterpret_cast<intptr_t>(rt_.multiRetModeSlot()));
+    if (want_multi) b.build_store(Type::i8(), mode_slot, 0, b.build_trunc_i8(b.build_iconst_i32(0)));
+    BValue* direct = b.build_call(symbol, Type::i64(), {cl, arg_buf, nargs_v});
+    direct->defining_instruction()->set_inline_hint();
+    if (want_multi) {
+        // A return of one value leaves the mode unset: set it, as
+        // brasslua_rt_call does.
+        BasicBlock* single_bb = st.newBlock("tcall_single");
+        BValue* mode = b.build_load(Type::i8(), mode_slot, 0);
+        b.build_br_if(b.build_eq(b.build_zext_i64(mode), b.build_iconst_i64(0)), single_bb, {}, merge_bb, {direct});
+        b.position_at_end(single_bb);
+        emitSetSingleRet(st, direct);
+    }
+    b.build_br(merge_bb, {direct});
+
+    b.position_at_end(other_bb);
+    BValue* other = want_multi ? b.build_call("brasslua_rt_call", Type::i64(), {callee_bits, arg_buf, nargs_v})
+                               : emitClosureCall(st, callee_bits, arg_buf, nargs_v);
+    b.build_br(merge_bb, {other});
+
+    b.position_at_end(merge_bb);
+    return merge_bb->param(0);
+}
+
 void MirModuleLowerer::emitSetSingleRet(FunctionBuildState& st, BValue* boxed) {
     auto& b = st.builder;
     b.build_store(Type::i64(), b.build_iconst_i64(reinterpret_cast<intptr_t>(rt_.singleRetSlot())), 0, boxed);
@@ -649,7 +691,7 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
         BValue* hit = b.build_eq(callee_bits, b.build_iconst_i64(static_cast<int64_t>(builtin_bits)));
         if (args_ok) hit = b.build_and(hit, args_ok);
         BasicBlock* fast_bb = st.newBlock("builtin_bet");
-        BasicBlock* call_bb = st.newBlock("builtin_call");
+        BasicBlock* call_bb = st.newColdBlock("builtin_call");
         builtin_merge = st.newBlock("builtin_merge", {Type::i64()});
         emitSite(st, hit, fast_bb, call_bb, true);
         b.position_at_end(fast_bb);
@@ -676,7 +718,13 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
         res = b.build_call("brasslua_rt_call_multiret", Type::i64(), {callee_bits, arg_buf, fixed_v});
     } else {
         BValue* nargs_v = b.build_iconst_i64(static_cast<int64_t>(call.args.size()));
-        res = want_multi ? b.build_call("brasslua_rt_call", Type::i64(), {callee_bits, arg_buf, nargs_v})
+        const CompiledFuncSig* target = nullptr;
+        if (const auto* id = std::get_if<IdentExpr>(&call.callee->node)) {
+            auto fit = known_functions_.find(varKey(id->symbol_id, id->name));
+            if (fit != known_functions_.end()) target = &fit->second;
+        }
+        res = target ? emitTargetCall(st, target->boxed_symbol, callee_bits, arg_buf, nargs_v, want_multi)
+            : want_multi ? b.build_call("brasslua_rt_call", Type::i64(), {callee_bits, arg_buf, nargs_v})
                          : emitClosureCall(st, callee_bits, arg_buf, nargs_v);
     }
 
@@ -722,7 +770,7 @@ MirValue MirModuleLowerer::lowerMethodCallExpr(FunctionBuildState& st, const Met
     // here. Anything else (a host object's method, a function __index) is
     // the runtime's.
     BasicBlock* hit_bb = st.newBlock("mcall_hit", {Type::i64()});
-    BasicBlock* slow_bb = st.newBlock("mcall_slow");
+    BasicBlock* slow_bb = st.newColdBlock("mcall_slow");
     BasicBlock* merge_bb = st.newBlock("mcall_merge", {Type::i64()});
     emitFieldProbe(st, obj_bits, id, /*through_index=*/true, /*nil_is_hit=*/false, hit_bb, slow_bb);
 

@@ -19,7 +19,7 @@ BValue* emitIntKeyBet(MirModuleLowerer& lowerer, FunctionBuildState& st, const E
     BValue* is_int = b.build_eq(b.build_lshr(key_bits, b.build_iconst_i64(48)),
                                 b.build_iconst_i64(static_cast<int64_t>(Tag::Int47)));
     BasicBlock* fast_bb = st.newBlock("key_int");
-    slow_bb = st.newBlock("key_any");
+    slow_bb = st.newColdBlock("key_any");
     lowerer.emitSite(st, is_int, fast_bb, slow_bb, true);
     b.position_at_end(fast_bb);
     BValue* c16 = b.build_iconst_i64(16);
@@ -50,7 +50,7 @@ MirValue MirModuleLowerer::lowerIndexLoad(FunctionBuildState& st, const IndexExp
 
         BasicBlock* check_bounds_bb = st.newBlock("arr_ld_bounds");
         BasicBlock* fast_ld_bb = st.newBlock("arr_ld_fast");
-        BasicBlock* slow_ld_bb = st.newBlock("arr_ld_slow");
+        BasicBlock* slow_ld_bb = st.newColdBlock("arr_ld_slow");
         BasicBlock* merge_bb = st.newBlock("arr_ld_merge", {Type::i64()});
         b.build_br_if(is_tbl, check_bounds_bb, slow_ld_bb);
 
@@ -107,7 +107,7 @@ void MirModuleLowerer::lowerIndexStore(FunctionBuildState& st, const IndexExpr& 
 
         BasicBlock* check_bounds_bb = st.newBlock("arr_st_bounds");
         BasicBlock* fast_st_bb = st.newBlock("arr_st_fast");
-        BasicBlock* slow_st_bb = st.newBlock("arr_st_slow");
+        BasicBlock* slow_st_bb = st.newColdBlock("arr_st_slow");
         BasicBlock* merge_bb = st.newBlock("arr_st_merge");
         b.build_br_if(is_tbl, check_bounds_bb, slow_st_bb);
 
@@ -274,7 +274,7 @@ void MirModuleLowerer::emitFieldProbe(FunctionBuildState& st, BValue* obj_bits, 
 
 BValue* MirModuleLowerer::emitFieldGet(FunctionBuildState& st, BValue* obj_bits, uint32_t intern_id) {
     auto& b = st.builder;
-    BasicBlock* slow_bb = st.newBlock("fld_ld_slow");
+    BasicBlock* slow_bb = st.newColdBlock("fld_ld_slow");
     BasicBlock* merge_bb = st.newBlock("fld_ld_merge", {Type::i64()});
     emitFieldProbe(st, obj_bits, intern_id, /*through_index=*/true, /*nil_is_hit=*/true, merge_bb, slow_bb);
     b.position_at_end(slow_bb);
@@ -287,7 +287,7 @@ BValue* MirModuleLowerer::emitFieldGet(FunctionBuildState& st, BValue* obj_bits,
 void MirModuleLowerer::emitFieldSet(FunctionBuildState& st, BValue* obj_bits, uint32_t intern_id, BValue* val_bits) {
     auto& b = st.builder;
     LuaString* s = rt_.getLuaStringById(intern_id);
-    BasicBlock* slow_bb = st.newBlock("fld_st_slow");
+    BasicBlock* slow_bb = st.newColdBlock("fld_st_slow");
     BasicBlock* merge_bb = st.newBlock("fld_st_merge");
     // A "__" key may be a metamethod of a table used as a metatable: its
     // store goes through the runtime, which drops the metatable's cache.

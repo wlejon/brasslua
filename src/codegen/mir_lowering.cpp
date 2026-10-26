@@ -327,7 +327,7 @@ MirValue MirModuleLowerer::loadVar(FunctionBuildState& st, uint32_t symbol_id,
     // A global is a field of the env table (pinned, so its address is a
     // constant of the code): probed inline, the rest (a function __index,
     // a name the host may answer) left to the runtime.
-    BasicBlock* slow_bb = st.newBlock("glb_ld_slow");
+    BasicBlock* slow_bb = st.newColdBlock("glb_ld_slow");
     BasicBlock* merge_bb = st.newBlock("glb_ld_merge", {Type::i64()});
     emitFieldProbe(st, emitEnvConst(st), intern_id, /*through_index=*/true,
                    /*nil_is_hit=*/!rt_.hostBridge().getGlobal, merge_bb, slow_bb);

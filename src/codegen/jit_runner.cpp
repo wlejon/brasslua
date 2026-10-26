@@ -33,6 +33,7 @@ void registerBrassLuaRuntimeSymbols(brass::codegen::JitExecutionEngine& engine) 
         engine.register_function_signature(name, ret, std::vector<Type>(params));
     };
 
+    reg("brasslua_rt_resume", &brasslua_rt_resume, Type::i64(), {Type::i64(), Type::i32(), Type::ptr()});
     reg("brasslua_rt_table_new", &brasslua_rt_table_new, Type::i64(), {Type::i32(), Type::i32()});
     reg("brasslua_rt_table_get", &brasslua_rt_table_get, Type::i64(), {Type::i64(), Type::i64()});
     reg("brasslua_rt_table_set", &brasslua_rt_table_set, Type::i64(), {Type::i64(), Type::i64(), Type::i64()});
@@ -115,6 +116,10 @@ LuaNativeFn compileLuaChunk(std::string_view source, const ExecutionOptions& opt
     if (opts.optimize) {
         brass::PassPipelineOptions popts = brass::production_pass_pipeline_options();
         popts.enable_sroa = true;
+        // Calls of the function a call is likely of are hinted (emitTargetCall).
+        popts.enable_inlining = true;
+        popts.inliner.only_inline_leaf_functions = false;
+        popts.inliner.max_total_caller_instructions = 6000;
         brass::run_pass_pipeline(mod, popts);
     }
 

@@ -13,9 +13,6 @@ class Instruction;
 namespace codegen {
 class JitExecutionEngine;
 }
-namespace runtime {
-class DeoptFrame;
-}
 } // namespace brass
 
 namespace brasslua {
@@ -51,16 +48,25 @@ public:
     // each armed function's failed guards resume in its continuations.
     void install(brass::codegen::JitExecutionEngine& engine);
 
-private:
+    // One armed function. A failed guard calls its exit stub, which hands
+    // the guard's state to the runtime (brasslua_rt_resume): `resume` runs
+    // the site's continuation and returns the function's result as bits.
+    // A stub is an ordinary call, so a function inlined with its guards
+    // resumes in its own continuation and the caller goes on with the result.
     struct Armed;
-    uint64_t resume(Armed& armed, const brass::runtime::DeoptFrame& frame);
+    uint64_t resume(Armed& armed, uint32_t resume_id, const uint64_t* state);
+
+private:
+    void buildExitStub(brass::Module& mod, Armed& armed, const std::string& name, uint32_t resume_id,
+                       const std::vector<brass::Value*>& state);
     void* buildContinuation(Armed& armed, uint32_t resume_id);
 
     std::unique_ptr<brass::Module> generic_;
     std::vector<std::unique_ptr<Armed>> armed_;
     brass::codegen::JitExecutionEngine* engine_ = nullptr;
     std::vector<std::unique_ptr<brass::codegen::JitExecutionEngine>> continuation_engines_;
-    std::vector<void*> resumer_entries_;
 };
+
+extern "C" uint64_t brasslua_rt_resume(void* armed, uint32_t resume_id, const uint64_t* state);
 
 } // namespace brasslua
