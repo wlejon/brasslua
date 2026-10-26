@@ -306,6 +306,7 @@ struct RuntimeState::Impl {
 
     std::vector<RuntimeState::RootedValues*> rooted_values;
     LuaTable* env_table = nullptr;
+    std::unordered_map<std::string, uint64_t> builtins; // registerBuiltin
     LuaTable* string_metatable = nullptr;
     LuaCoroutine* running_coroutine = nullptr;
     LuaCoroutine* main_thread = nullptr; // made when first asked for
@@ -337,6 +338,7 @@ struct RuntimeState::Impl {
         for (RuntimeState::RootedValues* r : rooted_values) {
             for (uint64_t& v : r->values) t.visit(&v);
         }
+        for (auto& [name, bits] : builtins) t.visit(&bits);
         if (rt.multiret_mode_ == 1) {
             t.visit(&rt.single_ret_);
         } else if (rt.multiret_mode_ == 2) {
@@ -511,6 +513,7 @@ void RuntimeState::reset() {
     impl_->intern_weak_slot.clear();
     impl_->free_ids.clear();
     impl_->env_table = nullptr;
+    impl_->builtins.clear();
     impl_->string_metatable = nullptr;
     impl_->running_coroutine = nullptr;
     impl_->main_thread = nullptr;
@@ -631,6 +634,15 @@ uint64_t RuntimeState::makeStringValue(std::string_view str) {
 
 LuaTable* RuntimeState::envTable() const noexcept {
     return impl_->env_table;
+}
+
+void RuntimeState::registerBuiltin(std::string_view name, Value closure) {
+    impl_->builtins[std::string(name)] = closure.rawBits();
+}
+
+uint64_t RuntimeState::builtinBits(std::string_view name) const {
+    auto it = impl_->builtins.find(std::string(name));
+    return it == impl_->builtins.end() ? kNilBits : it->second;
 }
 
 void RuntimeState::setGlobal(std::string_view name, Value val) {

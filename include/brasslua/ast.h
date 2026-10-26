@@ -116,6 +116,9 @@ struct FieldExpr {
 struct CallExpr {
     ExprPtr callee;
     std::vector<ExprPtr> args;
+    // The library function the callee likely is ("math.sqrt"), named by the
+    // hinted run: the code bets on it behind a check of the callee.
+    std::string builtin;
 };
 
 struct MethodCallExpr {

@@ -134,4 +134,40 @@ FuncBody* singleReturnedClosure(const FuncBody& fn) {
     return fe ? const_cast<FuncBody*>(&fe->func) : nullptr;
 }
 
+InferredType stdlibCallHint(const Expr& callee, std::string_view builtin) {
+    if (builtin.rfind("math.", 0) == 0) {
+        const std::string_view f = builtin.substr(5);
+        if (f == "type") return InferredType::String;
+        if (f == "ult") return InferredType::Bool;
+        static constexpr const char* kFloatOnly[] = {"sqrt", "sin", "cos", "tan", "asin",
+                                                     "acos", "atan", "exp", "log"};
+        for (const char* ff : kFloatOnly) {
+            if (f == ff) return InferredType::Float64;
+        }
+        return InferredType::Number;
+    }
+    if (builtin.rfind("bit.", 0) == 0) {
+        return builtin == "bit.tohex" ? InferredType::String : InferredType::Int64;
+    }
+    if (const auto* id = std::get_if<IdentExpr>(&callee.node)) {
+        if (id->symbol_id == 0) {
+            if (id->name == "tonumber") return InferredType::Number;
+            if (id->name == "tostring" || id->name == "type") return InferredType::String;
+        }
+        return InferredType::Unknown;
+    }
+    const auto* fe = std::get_if<FieldExpr>(&callee.node);
+    const auto* base = fe ? std::get_if<IdentExpr>(&fe->table->node) : nullptr;
+    if (!base || base->symbol_id != 0) return InferredType::Unknown;
+    if (base->name == "string") {
+        if (fe->field == "len" || fe->field == "byte") return InferredType::Int64;
+        if (fe->field == "sub" || fe->field == "format" || fe->field == "char" || fe->field == "lower" ||
+            fe->field == "upper" || fe->field == "rep" || fe->field == "reverse") {
+            return InferredType::String;
+        }
+    }
+    if (base->name == "os" && fe->field == "clock") return InferredType::Float64;
+    return InferredType::Unknown;
+}
+
 } // namespace brasslua

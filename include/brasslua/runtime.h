@@ -69,6 +69,12 @@ public:
     Value getGlobal(std::string_view name);
     LuaTable* envTable() const noexcept;
 
+    // The library functions compiled code bets on by name ("math.sqrt"),
+    // checking a callee against their bits: each is held for the runtime's
+    // life, so no other value ever has its bits. Nil bits for none.
+    void registerBuiltin(std::string_view name, Value closure);
+    uint64_t builtinBits(std::string_view name) const;
+
     // Allocations on brass::gc::Heap
     LuaTable* allocTable(uint32_t array_hint = 0, uint32_t hash_hint = 0);
     void ensureTableArrayCapacity(LuaTable* tbl, uint32_t min_cap);
@@ -92,6 +98,8 @@ public:
     bool isMultiRetSet() const noexcept { return multiret_mode_ != 0; }
     // Compiled code clears the mode with a store here (its code is this state's).
     uint8_t* multiRetModeSlot() noexcept { return &multiret_mode_; }
+    // ... and sets one result with stores here and to the mode (1).
+    uint64_t* singleRetSlot() noexcept { return &single_ret_; }
     size_t multiRetCount() const noexcept {
         if (multiret_mode_ == 1) return 1;
         return multiret_mode_ == 2 ? multiret_.size() : 0;

@@ -10,20 +10,7 @@ bool isCallOrVararg(const Expr& e) noexcept {
     if (std::holds_alternative<VarargExpr>(e.node) || std::holds_alternative<MethodCallExpr>(e.node)) {
         return true;
     }
-    if (const auto* ce = std::get_if<CallExpr>(&e.node)) {
-        if (const auto* fe = std::get_if<FieldExpr>(&ce->callee->node)) {
-            if (const auto* base = std::get_if<IdentExpr>(&fe->table->node)) {
-                if (base->symbol_id == 0 &&
-                    (base->name == "math" || base->name == "bit" || base->name == "bit32")) {
-                    if (fe->field != "frexp" && fe->field != "modf") {
-                        return false;
-                    }
-                }
-            }
-        }
-        return true;
-    }
-    return false;
+    return std::holds_alternative<CallExpr>(e.node);
 }
 
 namespace {
@@ -257,6 +244,70 @@ BValue* emitClosureCall(FunctionBuildState& st, BValue* callee_bits, BValue* arg
     return merge_bb->param(0);
 }
 
+// A builtin's answer computed inline for these arguments, as the arguments'
+// hints bet they are, with `ok` the check that they are (null when nothing
+// is to check). False when the builtin has no inline form for them.
+bool emitBuiltinBody(FunctionBuildState& st, std::string_view name, const CallExpr& call,
+                     const std::vector<MirValue>& args, MirValue& out, BValue*& ok) {
+    auto& b = st.builder;
+    ok = nullptr;
+    auto all = [&](BValue* c) { ok = ok ? b.build_and(ok, c) : c; };
+    if (name == "math.sqrt" || name == "math.abs") {
+        if (args.size() != 1) return false;
+        const MirValue& a = args[0];
+        if (name == "math.abs" && (a.rep == Rep::Int64 || a.rep == Rep::Float64)) {
+            // An integer's absolute value wraps as Lua's does (minint is itself).
+            BValue* r = a.rep == Rep::Float64 ? b.build_fabs_f64(a.val)
+                                              : b.build_select(b.build_slt(a.val, b.build_iconst_i64(0)),
+                                                               b.build_sub(b.build_iconst_i64(0), a.val), a.val);
+            out = MirValue{r, a.rep, true};
+            return true;
+        }
+        BValue *f = nullptr, *chk = nullptr;
+        bool dbl = false;
+        const InferredType hint = call.args[0]->hint;
+        if (name == "math.abs" && hint != InferredType::Float64) return false;
+        if (!betFloatOperand(st, a, a.val, hint, false, f, chk, dbl)) return false;
+        if (chk) all(chk);
+        out = MirValue{name == "math.sqrt" ? b.build_sqrt_f64(f) : b.build_fabs_f64(f), Rep::Float64, true};
+        return true;
+    }
+    if (name.rfind("bit.", 0) != 0) return false;
+    const std::string_view op = name.substr(4);
+    const bool unary = op == "tobit" || op == "bnot";
+    const bool shift = op == "lshift" || op == "rshift" || op == "arshift";
+    const bool fold = op == "band" || op == "bor" || op == "bxor";
+    if (!unary && !shift && !fold) return false;
+    if (unary ? args.size() != 1 : shift ? args.size() != 2 : args.size() < 2) return false;
+    // Each argument an integer: its low 32 bits (an inline one's payload's).
+    std::vector<BValue*> v32;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const MirValue& a = args[i];
+        if (a.rep == Rep::Int64) {
+            v32.push_back(b.build_trunc_i32(a.val));
+        } else if (a.rep == Rep::Boxed && call.args[i]->hint == InferredType::Int64) {
+            all(b.build_eq(b.build_lshr(a.val, b.build_iconst_i64(48)),
+                           b.build_iconst_i64(static_cast<int64_t>(Tag::Int47))));
+            v32.push_back(b.build_trunc_i32(a.val));
+        } else {
+            return false;
+        }
+    }
+    BValue* r = v32[0];
+    if (op == "bnot") {
+        r = b.build_xor(r, b.build_iconst_i32(-1));
+    } else if (shift) {
+        BValue* n = b.build_and(v32[1], b.build_iconst_i32(31));
+        r = op == "lshift" ? b.build_shl(r, n) : op == "rshift" ? b.build_lshr(r, n) : b.build_ashr(r, n);
+    } else if (fold) {
+        for (size_t i = 1; i < v32.size(); ++i) {
+            r = op == "band" ? b.build_and(r, v32[i]) : op == "bor" ? b.build_or(r, v32[i]) : b.build_xor(r, v32[i]);
+        }
+    }
+    out = MirValue{b.build_sext_i64(r), Rep::Int64, true};
+    return true;
+}
+
 } // namespace
 
 MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryExpr& bin, InferredType result_type) {
@@ -479,6 +530,13 @@ MirValue MirModuleLowerer::lowerBinaryExpr(FunctionBuildState& st, const BinaryE
     return MirValue{b.build_call(rt_fn, Type::i64(), {la, rb}), Rep::Boxed};
 }
 
+void MirModuleLowerer::emitSetSingleRet(FunctionBuildState& st, BValue* boxed) {
+    auto& b = st.builder;
+    b.build_store(Type::i64(), b.build_iconst_i64(reinterpret_cast<intptr_t>(rt_.singleRetSlot())), 0, boxed);
+    b.build_store(Type::i8(), b.build_iconst_i64(reinterpret_cast<intptr_t>(rt_.multiRetModeSlot())), 0,
+                  b.build_trunc_i8(b.build_iconst_i32(1)));
+}
+
 MirValue MirModuleLowerer::lowerMultiExpr(FunctionBuildState& st, const Expr& expr) {
     auto& b = st.builder;
     if (std::holds_alternative<VarargExpr>(expr.node)) {
@@ -497,10 +555,7 @@ MirValue MirModuleLowerer::lowerMultiExpr(FunctionBuildState& st, const Expr& ex
     st.multi_result_wanted = false;
     if (!mv.single) return mv;
     BValue* boxed = emitBox(st, mv);
-    BValue* one = st.emitEntryAlloca(8, 8);
-    b.build_store(Type::i64(), one, 0, boxed);
-    b.build_call("brasslua_rt_set_multiret", Type::void_type(), {one, b.build_iconst_i64(1)});
-    b.build_store(Type::i64(), one, 0, b.build_iconst_i64(0));
+    emitSetSingleRet(st, boxed);
     return MirValue{boxed, Rep::Boxed, false};
 }
 
@@ -510,82 +565,7 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
 
     bool last_is_multiret = !call.args.empty() && isCallOrVararg(*call.args.back());
 
-    // 1. Check for inline math.* and bit.* intrinsics when arguments are numeric (and not multiret tail)
-    if (!last_is_multiret) {
-        if (const auto* fe = std::get_if<FieldExpr>(&call.callee->node)) {
-            if (const auto* base = std::get_if<IdentExpr>(&fe->table->node)) {
-                if (base->symbol_id == 0) {
-                    if (base->name == "math" && call.args.size() == 1) {
-                        if (fe->field == "sqrt") {
-                            MirValue a0 = lowerExpr(st, *call.args[0]);
-                            BValue* f0 = emitUnboxFloat64(st, a0);
-                            return MirValue{b.build_sqrt_f64(f0), Rep::Float64, true};
-                        }
-                        if (fe->field == "abs" && call.args[0]->inferred_type == InferredType::Float64) {
-                            MirValue a0 = lowerExpr(st, *call.args[0]);
-                            BValue* f0 = emitUnboxFloat64(st, a0);
-                            return MirValue{b.build_fabs_f64(f0), Rep::Float64, true};
-                        }
-                    }
-                    if ((base->name == "bit" || base->name == "bit32") && !call.args.empty()) {
-                        auto argI32 = [&](const Expr& e) -> BValue* {
-                            MirValue mv = lowerExpr(st, e);
-                            BValue* i64 = emitUnboxInt64(st, mv);
-                            return b.build_trunc_i32(i64);
-                        };
-                        auto sext32 = [&](BValue* v32) -> MirValue {
-                            return MirValue{b.build_sext_i64(v32), Rep::Int64, true};
-                        };
-                        if (fe->field == "bnot" && call.args.size() == 1) {
-                            BValue* x = argI32(*call.args[0]);
-                            return sext32(b.build_xor(x, b.build_iconst_i32(-1)));
-                        }
-                        if (fe->field == "tobit" && call.args.size() == 1) {
-                            return sext32(argI32(*call.args[0]));
-                        }
-                        if (fe->field == "band" && call.args.size() >= 2) {
-                            BValue* acc = argI32(*call.args[0]);
-                            for (size_t i = 1; i < call.args.size(); ++i) {
-                                acc = b.build_and(acc, argI32(*call.args[i]));
-                            }
-                            return sext32(acc);
-                        }
-                        if (fe->field == "bor" && call.args.size() >= 2) {
-                            BValue* acc = argI32(*call.args[0]);
-                            for (size_t i = 1; i < call.args.size(); ++i) {
-                                acc = b.build_or(acc, argI32(*call.args[i]));
-                            }
-                            return sext32(acc);
-                        }
-                        if (fe->field == "bxor" && call.args.size() >= 2) {
-                            BValue* acc = argI32(*call.args[0]);
-                            for (size_t i = 1; i < call.args.size(); ++i) {
-                                acc = b.build_xor(acc, argI32(*call.args[i]));
-                            }
-                            return sext32(acc);
-                        }
-                        if (fe->field == "lshift" && call.args.size() == 2) {
-                            BValue* x = argI32(*call.args[0]);
-                            BValue* n = b.build_and(argI32(*call.args[1]), b.build_iconst_i32(31));
-                            return sext32(b.build_shl(x, n));
-                        }
-                        if (fe->field == "rshift" && call.args.size() == 2) {
-                            BValue* x = argI32(*call.args[0]);
-                            BValue* n = b.build_and(argI32(*call.args[1]), b.build_iconst_i32(31));
-                            return sext32(b.build_lshr(x, n));
-                        }
-                        if (fe->field == "arshift" && call.args.size() == 2) {
-                            BValue* x = argI32(*call.args[0]);
-                            BValue* n = b.build_and(argI32(*call.args[1]), b.build_iconst_i32(31));
-                            return sext32(b.build_ashr(x, n));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Direct unboxed call when calling a known function with `has_unboxed`
+    // 1. Direct unboxed call when calling a known function with `has_unboxed`
     if (!last_is_multiret) {
         if (const auto* id = std::get_if<IdentExpr>(&call.callee->node)) {
             auto fit = known_functions_.find(varKey(id->symbol_id, id->name));
@@ -650,19 +630,42 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
         }
     }
 
-    // 3. General boxed function call (`obj.m(x)` or `f(x)` with NO implicit receiver)
+    // 2. General boxed function call (`obj.m(x)` or `f(x)` with NO implicit receiver)
     MirValue callee_mv = lowerExpr(st, *call.callee);
     BValue* callee_bits = emitBox(st, callee_mv);
 
+    size_t fixed_count = last_is_multiret ? (call.args.size() - 1) : call.args.size();
+    std::vector<MirValue> arg_mvs;
+    arg_mvs.reserve(fixed_count);
+    for (size_t i = 0; i < fixed_count; ++i) arg_mvs.push_back(lowerExpr(st, *call.args[i]));
+
+    // A bet the callee is the library function the hints name, called with
+    // the arguments they say: its answer inline, else the call below.
+    BasicBlock* builtin_merge = nullptr;
+    const uint64_t builtin_bits = call.builtin.empty() || last_is_multiret ? kNilBits : rt_.builtinBits(call.builtin);
+    MirValue inline_mv;
+    BValue* args_ok = nullptr;
+    if (builtin_bits != kNilBits && emitBuiltinBody(st, call.builtin, call, arg_mvs, inline_mv, args_ok)) {
+        BValue* hit = b.build_eq(callee_bits, b.build_iconst_i64(static_cast<int64_t>(builtin_bits)));
+        if (args_ok) hit = b.build_and(hit, args_ok);
+        BasicBlock* fast_bb = st.newBlock("builtin_bet");
+        BasicBlock* call_bb = st.newBlock("builtin_call");
+        builtin_merge = st.newBlock("builtin_merge", {Type::i64()});
+        emitSite(st, hit, fast_bb, call_bb, true);
+        b.position_at_end(fast_bb);
+        BValue* boxed = emitBox(st, inline_mv);
+        if (want_multi) emitSetSingleRet(st, boxed);
+        b.build_br(builtin_merge, {boxed});
+        b.position_at_end(call_bb);
+    }
+
     // Allocate a dedicated stack buffer for this call's fixed prefix arguments so nested calls
     // with > 4 arguments never overwrite an outer call's arguments.
-    size_t fixed_count = last_is_multiret ? (call.args.size() - 1) : call.args.size();
     BValue* arg_buf = fixed_count > 0
                           ? st.emitEntryAlloca(static_cast<uint32_t>(fixed_count * 8), 8)
                           : b.build_iconst_i64(0);
     for (size_t i = 0; i < fixed_count; ++i) {
-        MirValue amv = lowerExpr(st, *call.args[i]);
-        BValue* abits = emitBox(st, amv);
+        BValue* abits = emitBox(st, arg_mvs[i]);
         b.build_store(Type::i64(), arg_buf, static_cast<int32_t>(i * 8), abits);
     }
 
@@ -682,6 +685,11 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
         for (size_t i = 0; i < fixed_count; ++i) {
             b.build_store(Type::i64(), arg_buf, static_cast<int32_t>(i * 8), zero);
         }
+    }
+    if (builtin_merge) {
+        b.build_br(builtin_merge, {res});
+        b.position_at_end(builtin_merge);
+        return MirValue{builtin_merge->param(0), Rep::Boxed, false};
     }
     return MirValue{res, Rep::Boxed};
 }

@@ -446,6 +446,11 @@ private:
                         InferredType t = InferredType::Unknown;
                         if (i < s.init.size()) {
                             t = s.init[i]->inferred_type;
+                            if (!sound_ && s.vars[i].symbol_id != 0) {
+                                if (std::string bn = builtinOf(*s.init[i]); !bn.empty()) {
+                                    builtin_aliases_[s.vars[i].symbol_id] = std::move(bn);
+                                }
+                            }
                             if (auto* fe = std::get_if<FuncExpr>(&s.init[i]->node)) {
                                 if (functions_.find(vkey) == functions_.end()) {
                                     function_order_.push_back(vkey);
@@ -617,46 +622,26 @@ private:
             stmt.node);
     }
 
-    // A library global may have been replaced, so only a guess.
-    InferredType inferStdlibCallType(const Expr& callee) const {
-        if (sound_) return InferredType::Unknown;
-        if (const auto* id = std::get_if<IdentExpr>(&callee.node)) {
-            if (id->symbol_id == 0) {
-                if (id->name == "tonumber") return InferredType::Number;
-                if (id->name == "tostring" || id->name == "type") return InferredType::String;
-            }
-        } else if (const auto* fe = std::get_if<FieldExpr>(&callee.node)) {
+    // The math or bit library function an expression likely is: `math.f`, or
+    // a local first given it (`local sqrt = math.sqrt`).
+    std::string builtinOf(const Expr& e) const {
+        if (const auto* fe = std::get_if<FieldExpr>(&e.node)) {
             if (const auto* base = std::get_if<IdentExpr>(&fe->table->node)) {
-                if (base->symbol_id == 0) {
-                    if (base->name == "math") {
-                        if (fe->field == "type") return InferredType::String;
-                        if (fe->field == "ult") return InferredType::Bool;
-                        static constexpr const char* kFloatOnly[] = {"sqrt", "sin", "cos", "tan", "asin",
-                                                                     "acos", "atan", "exp", "log"};
-                        for (const char* f : kFloatOnly) {
-                            if (fe->field == f) return InferredType::Float64;
-                        }
-                        return InferredType::Number;
-                    }
-                    if (base->name == "bit" || base->name == "bit32") {
-                        if (fe->field == "tohex") return InferredType::String;
-                        return InferredType::Int64;
-                    }
-                    if (base->name == "string") {
-                        if (fe->field == "len" || fe->field == "byte") return InferredType::Int64;
-                        if (fe->field == "sub" || fe->field == "format" || fe->field == "char" ||
-                            fe->field == "lower" || fe->field == "upper" || fe->field == "rep" ||
-                            fe->field == "reverse") {
-                            return InferredType::String;
-                        }
-                    }
-                    if (base->name == "os" && fe->field == "clock") {
-                        return InferredType::Float64;
-                    }
+                if (base->symbol_id == 0 && (base->name == "math" || base->name == "bit")) {
+                    return base->name + "." + fe->field;
                 }
             }
+        } else if (const auto* id = std::get_if<IdentExpr>(&e.node)) {
+            if (id->symbol_id != 0) {
+                auto it = builtin_aliases_.find(id->symbol_id);
+                if (it != builtin_aliases_.end()) return it->second;
+            }
         }
-        return InferredType::Unknown;
+        return {};
+    }
+
+    InferredType inferStdlibCallType(const Expr& callee) const {
+        return sound_ ? InferredType::Unknown : stdlibCallHint(callee, builtinOf(callee));
     }
 
     void analyzeExpr(Expr& expr) {
@@ -823,6 +808,7 @@ private:
                     for (auto& arg : e.args) {
                         analyzeExpr(*arg);
                     }
+                    if (!sound_) e.builtin = builtinOf(*e.callee);
                     InferredType std_t = inferStdlibCallType(*e.callee);
                     if (std_t != InferredType::Unknown) {
                         return std_t;
@@ -916,6 +902,7 @@ private:
     std::string current_func_key_;
     std::unordered_map<uint32_t, VarBinding> locals_;
     std::unordered_map<std::string, InferredType> globals_;
+    std::unordered_map<uint32_t, std::string> builtin_aliases_; // builtinOf
     std::vector<std::string> function_order_;
     std::unordered_map<std::string, FuncBody*> functions_;
     std::unordered_set<std::string> mutated_vars_;

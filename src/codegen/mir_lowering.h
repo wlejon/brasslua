@@ -26,15 +26,14 @@ enum class Rep : uint8_t {
     BoolBit = 3, // brass::Type::i32() (unboxed 0/1 boolean condition)
 };
 
-// A call or `...` that may give any number of values (not in parentheses,
-// and not a single-valued math/bit intrinsic).
+// A call or `...` that may give any number of values (not in parentheses).
 bool isCallOrVararg(const Expr& e) noexcept;
 
 struct MirValue {
     brass::Value* val = nullptr;
     Rep rep = Rep::Boxed;
     // A call that made its one value without the multiret buffer (an
-    // intrinsic, an inlined body, a function's unboxed entry); see
+    // inlined body, a function's unboxed entry); see
     // lowerMultiExpr.
     bool single = false;
 };
@@ -167,6 +166,8 @@ public:
     // last of a multiple assignment's values, a generic for's iterator, a
     // returned call): a call made without the buffer leaves its value there.
     MirValue lowerMultiExpr(FunctionBuildState& st, const Expr& expr);
+    // Sets the multiret state to this one value, as a call's return would.
+    void emitSetSingleRet(FunctionBuildState& st, brass::Value* boxed);
     MirValue lowerBinaryExpr(FunctionBuildState& st, const BinaryExpr& bin, InferredType result_type);
     MirValue lowerCallExpr(FunctionBuildState& st, const CallExpr& call, InferredType result_type);
     MirValue lowerMethodCallExpr(FunctionBuildState& st, const MethodCallExpr& mcall);

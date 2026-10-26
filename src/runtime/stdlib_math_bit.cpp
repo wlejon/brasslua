@@ -383,32 +383,37 @@ uint64_t osExit(void* /*cl*/, const uint64_t* args, int64_t nargs) {
 } // namespace
 
 void registerMathAndBitStdlib(RuntimeState& rt) {
+    // A library function, registered as the builtin compiled code bets on.
+    auto put = [&](LuaTable* tbl, std::string_view lib, std::string_view name, Value fn) {
+        setTableFieldStr(rt, tbl, name, fn);
+        rt.registerBuiltin(std::string(lib) + "." + std::string(name), fn);
+    };
     LuaTable* math_tbl = rt.allocTable(0, 32);
-    setTableFieldStr(rt, math_tbl, "abs", makeNativeClosure(rt, &mathAbs, 1));
-    setTableFieldStr(rt, math_tbl, "floor", makeNativeClosure(rt, &mathFloor, 1));
-    setTableFieldStr(rt, math_tbl, "ceil", makeNativeClosure(rt, &mathCeil, 1));
-    setTableFieldStr(rt, math_tbl, "sqrt", makeNativeClosure(rt, &mathSqrt, 1));
-    setTableFieldStr(rt, math_tbl, "sin", makeNativeClosure(rt, &mathSin, 1));
-    setTableFieldStr(rt, math_tbl, "cos", makeNativeClosure(rt, &mathCos, 1));
-    setTableFieldStr(rt, math_tbl, "tan", makeNativeClosure(rt, &mathTan, 1));
-    setTableFieldStr(rt, math_tbl, "asin", makeNativeClosure(rt, &mathAsin, 1));
-    setTableFieldStr(rt, math_tbl, "acos", makeNativeClosure(rt, &mathAcos, 1));
-    setTableFieldStr(rt, math_tbl, "atan", makeNativeClosure(rt, &mathAtan, 1));
-    setTableFieldStr(rt, math_tbl, "atan2", makeNativeClosure(rt, &mathAtan, 2));
-    setTableFieldStr(rt, math_tbl, "exp", makeNativeClosure(rt, &mathExp, 1));
-    setTableFieldStr(rt, math_tbl, "log", makeNativeClosure(rt, &mathLog, 1));
-    setTableFieldStr(rt, math_tbl, "log10", makeNativeClosure(rt, &mathLog10, 1));
-    setTableFieldStr(rt, math_tbl, "fmod", makeNativeClosure(rt, &mathFmod, 2));
-    setTableFieldStr(rt, math_tbl, "modf", makeNativeClosure(rt, &mathModf, 1));
-    setTableFieldStr(rt, math_tbl, "deg", makeNativeClosure(rt, &mathDeg, 1));
-    setTableFieldStr(rt, math_tbl, "rad", makeNativeClosure(rt, &mathRad, 1));
-    setTableFieldStr(rt, math_tbl, "min", makeNativeClosure(rt, &mathMin, 1));
-    setTableFieldStr(rt, math_tbl, "max", makeNativeClosure(rt, &mathMax, 1));
-    setTableFieldStr(rt, math_tbl, "random", makeNativeClosure(rt, &mathRandom, 0));
-    setTableFieldStr(rt, math_tbl, "randomseed", makeNativeClosure(rt, &mathRandomseed, 1));
-    setTableFieldStr(rt, math_tbl, "type", makeNativeClosure(rt, &mathType, 1));
-    setTableFieldStr(rt, math_tbl, "tointeger", makeNativeClosure(rt, &mathTointeger, 1));
-    setTableFieldStr(rt, math_tbl, "ult", makeNativeClosure(rt, &mathUlt, 2));
+    put(math_tbl, "math", "abs", makeNativeClosure(rt, &mathAbs, 1));
+    put(math_tbl, "math", "floor", makeNativeClosure(rt, &mathFloor, 1));
+    put(math_tbl, "math", "ceil", makeNativeClosure(rt, &mathCeil, 1));
+    put(math_tbl, "math", "sqrt", makeNativeClosure(rt, &mathSqrt, 1));
+    put(math_tbl, "math", "sin", makeNativeClosure(rt, &mathSin, 1));
+    put(math_tbl, "math", "cos", makeNativeClosure(rt, &mathCos, 1));
+    put(math_tbl, "math", "tan", makeNativeClosure(rt, &mathTan, 1));
+    put(math_tbl, "math", "asin", makeNativeClosure(rt, &mathAsin, 1));
+    put(math_tbl, "math", "acos", makeNativeClosure(rt, &mathAcos, 1));
+    put(math_tbl, "math", "atan", makeNativeClosure(rt, &mathAtan, 1));
+    put(math_tbl, "math", "atan2", makeNativeClosure(rt, &mathAtan, 2));
+    put(math_tbl, "math", "exp", makeNativeClosure(rt, &mathExp, 1));
+    put(math_tbl, "math", "log", makeNativeClosure(rt, &mathLog, 1));
+    put(math_tbl, "math", "log10", makeNativeClosure(rt, &mathLog10, 1));
+    put(math_tbl, "math", "fmod", makeNativeClosure(rt, &mathFmod, 2));
+    put(math_tbl, "math", "modf", makeNativeClosure(rt, &mathModf, 1));
+    put(math_tbl, "math", "deg", makeNativeClosure(rt, &mathDeg, 1));
+    put(math_tbl, "math", "rad", makeNativeClosure(rt, &mathRad, 1));
+    put(math_tbl, "math", "min", makeNativeClosure(rt, &mathMin, 1));
+    put(math_tbl, "math", "max", makeNativeClosure(rt, &mathMax, 1));
+    put(math_tbl, "math", "random", makeNativeClosure(rt, &mathRandom, 0));
+    put(math_tbl, "math", "randomseed", makeNativeClosure(rt, &mathRandomseed, 1));
+    put(math_tbl, "math", "type", makeNativeClosure(rt, &mathType, 1));
+    put(math_tbl, "math", "tointeger", makeNativeClosure(rt, &mathTointeger, 1));
+    put(math_tbl, "math", "ult", makeNativeClosure(rt, &mathUlt, 2));
     setTableFieldStr(rt, math_tbl, "pi", Value::fromDouble(3.14159265358979323846));
     setTableFieldStr(rt, math_tbl, "huge", Value::fromDouble(std::numeric_limits<double>::infinity()));
     setTableFieldStr(rt, math_tbl, "maxinteger", Value::fromInt64(std::numeric_limits<int64_t>::max()));
@@ -416,20 +421,19 @@ void registerMathAndBitStdlib(RuntimeState& rt) {
     rt.setGlobal("math", Value::fromTable(math_tbl));
 
     LuaTable* bit_tbl = rt.allocTable(0, 16);
-    setTableFieldStr(rt, bit_tbl, "tobit", makeNativeClosure(rt, &bitTobit, 1));
-    setTableFieldStr(rt, bit_tbl, "bnot", makeNativeClosure(rt, &bitBnot, 1));
-    setTableFieldStr(rt, bit_tbl, "band", makeNativeClosure(rt, &bitBand, 2));
-    setTableFieldStr(rt, bit_tbl, "bor", makeNativeClosure(rt, &bitBor, 2));
-    setTableFieldStr(rt, bit_tbl, "bxor", makeNativeClosure(rt, &bitBxor, 2));
-    setTableFieldStr(rt, bit_tbl, "lshift", makeNativeClosure(rt, &bitLshift, 2));
-    setTableFieldStr(rt, bit_tbl, "rshift", makeNativeClosure(rt, &bitRshift, 2));
-    setTableFieldStr(rt, bit_tbl, "arshift", makeNativeClosure(rt, &bitArshift, 2));
-    setTableFieldStr(rt, bit_tbl, "rol", makeNativeClosure(rt, &bitRol, 2));
-    setTableFieldStr(rt, bit_tbl, "ror", makeNativeClosure(rt, &bitRor, 2));
-    setTableFieldStr(rt, bit_tbl, "bswap", makeNativeClosure(rt, &bitBswap, 1));
-    setTableFieldStr(rt, bit_tbl, "tohex", makeNativeClosure(rt, &bitTohex, 1));
+    put(bit_tbl, "bit", "tobit", makeNativeClosure(rt, &bitTobit, 1));
+    put(bit_tbl, "bit", "bnot", makeNativeClosure(rt, &bitBnot, 1));
+    put(bit_tbl, "bit", "band", makeNativeClosure(rt, &bitBand, 2));
+    put(bit_tbl, "bit", "bor", makeNativeClosure(rt, &bitBor, 2));
+    put(bit_tbl, "bit", "bxor", makeNativeClosure(rt, &bitBxor, 2));
+    put(bit_tbl, "bit", "lshift", makeNativeClosure(rt, &bitLshift, 2));
+    put(bit_tbl, "bit", "rshift", makeNativeClosure(rt, &bitRshift, 2));
+    put(bit_tbl, "bit", "arshift", makeNativeClosure(rt, &bitArshift, 2));
+    put(bit_tbl, "bit", "rol", makeNativeClosure(rt, &bitRol, 2));
+    put(bit_tbl, "bit", "ror", makeNativeClosure(rt, &bitRor, 2));
+    put(bit_tbl, "bit", "bswap", makeNativeClosure(rt, &bitBswap, 1));
+    put(bit_tbl, "bit", "tohex", makeNativeClosure(rt, &bitTohex, 1));
     rt.setGlobal("bit", Value::fromTable(bit_tbl));
-    rt.setGlobal("bit32", Value::fromTable(bit_tbl));
 
     LuaTable* os_tbl = rt.allocTable(0, 8);
     setTableFieldStr(rt, os_tbl, "clock", makeNativeClosure(rt, &osClock, 0));

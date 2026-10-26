@@ -523,17 +523,7 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
                     } else if constexpr (std::is_same_v<T, FieldExpr>) {
                         self_e(self_e, *e.table);
                     } else if constexpr (std::is_same_v<T, CallExpr>) {
-                        bool is_intrinsic = false;
-                        if (const auto* fe = std::get_if<FieldExpr>(&e.callee->node)) {
-                            if (const auto* b = std::get_if<IdentExpr>(&fe->table->node)) {
-                                if (b->symbol_id == 0 &&
-                                    (b->name == "math" || b->name == "bit" || b->name == "bit32")) {
-                                    is_intrinsic = true;
-                                }
-                            }
-                        }
-                        if (!is_intrinsic) has_external_calls = true;
-                        for (const auto& a : e.args) self_e(self_e, *a);
+                        has_external_calls = true;
                     } else if constexpr (std::is_same_v<T, MethodCallExpr>) {
                         has_external_calls = true;
                     }

@@ -43,3 +43,19 @@ local f53 = 9007199254740992.0
 for k = 9007199254740991, 9007199254740993 do print(k == f53, k < f53, k <= f53, k > f53) end
 local big = math.maxinteger
 print(big == big + 0.0, big < big + 0.0, -big - 1 == -2 ^ 63, -big - 1 < -2 ^ 63)
+-- Library functions bet on: a string or integer argument, an alias, and
+-- the library replaced.
+local sqrt, abs = math.sqrt, math.abs
+local function roots(o) return math.sqrt(o.x), sqrt(o.x), abs(-o.x), math.abs(-o.x) end
+print(roots({x = 16.0}))
+print(roots({x = opaque(4)}))
+print(pcall(roots, {x = opaque("16")}))
+print(abs(opaque(math.mininteger)), math.abs(opaque(-7)), math.abs(-2.5))
+local function root_list(v) return {math.sqrt(v), math.sqrt(v + 0.0)} end
+print(#root_list(9.0), root_list(9.0)[2])
+local saved = math
+math = {sqrt = function(v) return "mine", v end, abs = saved.abs}
+print(math.sqrt(4.0), roots({x = 4.0}))
+print(#{math.sqrt(4.0)})
+math = saved
+print(math.sqrt(4.0), roots({x = 4.0}))
