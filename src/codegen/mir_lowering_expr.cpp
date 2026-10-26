@@ -135,7 +135,7 @@ MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, B
             BValue* hit = l_ok && r_ok ? b.build_and(l_ok, r_ok) : l_ok ? l_ok : r_ok;
             BasicBlock* fast_bb = st.newBlock("dyn_bet");
             BasicBlock* generic_bb = st.newColdBlock("dyn_generic");
-            lowerer.emitSite(st, hit, fast_bb, generic_bb, true);
+            lowerer.emitSite(st, hit, fast_bb, generic_bb, SpecKind::Arith);
             b.position_at_end(fast_bb);
             b.build_br(merge_bb, {emitFloatOp(lowerer, st, op, lf, rf)});
             b.position_at_end(generic_bb);
@@ -154,8 +154,10 @@ MirValue emitDynamicNumeric(MirModuleLowerer& lowerer, FunctionBuildState& st, B
     BasicBlock* slow_bb = st.newColdBlock("dyn_slow");
     if (op == BinOp::Div) {
         b.build_br(chk_num_bb);
+    } else if (bet_int) {
+        lowerer.emitSite(st, b.build_and(l_int, r_int), int_bb, chk_num_bb, SpecKind::Arith);
     } else {
-        lowerer.emitSite(st, b.build_and(l_int, r_int), int_bb, chk_num_bb, bet_int);
+        b.build_br_if(b.build_and(l_int, r_int), int_bb, chk_num_bb);
     }
 
     // Two inline integers.
@@ -693,7 +695,7 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
         BasicBlock* fast_bb = st.newBlock("builtin_bet");
         BasicBlock* call_bb = st.newColdBlock("builtin_call");
         builtin_merge = st.newBlock("builtin_merge", {Type::i64()});
-        emitSite(st, hit, fast_bb, call_bb, true);
+        emitSite(st, hit, fast_bb, call_bb, SpecKind::Builtin);
         b.position_at_end(fast_bb);
         BValue* boxed = emitBox(st, inline_mv);
         if (want_multi) emitSetSingleRet(st, boxed);
@@ -704,7 +706,7 @@ MirValue MirModuleLowerer::lowerCallExpr(FunctionBuildState& st, const CallExpr&
     // Allocate a dedicated stack buffer for this call's fixed prefix arguments so nested calls
     // with > 4 arguments never overwrite an outer call's arguments.
     BValue* arg_buf = fixed_count > 0
-                          ? st.emitEntryAlloca(static_cast<uint32_t>(fixed_count * 8), 8)
+                          ? st.emitEntrySlots(static_cast<uint32_t>(fixed_count))
                           : b.build_iconst_i64(0);
     for (size_t i = 0; i < fixed_count; ++i) {
         BValue* abits = emitBox(st, arg_mvs[i]);
@@ -754,7 +756,7 @@ MirValue MirModuleLowerer::lowerMethodCallExpr(FunctionBuildState& st, const Met
     // The arguments with the receiver first, as the method is called.
     bool last_is_multiret = !mcall.args.empty() && isCallOrVararg(*mcall.args.back());
     size_t fixed_count = (last_is_multiret ? (mcall.args.size() - 1) : mcall.args.size()) + 1;
-    BValue* arg_buf = st.emitEntryAlloca(static_cast<uint32_t>(fixed_count * 8), 8);
+    BValue* arg_buf = st.emitEntrySlots(static_cast<uint32_t>(fixed_count));
     b.build_store(Type::i64(), arg_buf, 0, obj_bits);
     for (size_t i = 1; i < fixed_count; ++i) {
         MirValue amv = lowerExpr(st, *mcall.args[i - 1]);

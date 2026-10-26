@@ -26,6 +26,17 @@ int main(int argc, char** argv) {
             opts.dump_mir = true;
             continue;
         }
+        if (std::strncmp(argv[i], "--tier=", 7) == 0) {
+            const std::string t = argv[i] + 7;
+            if (t == "interp") opts.tier = brasslua::ExecutionTier::Interpreter;
+            else if (t == "baseline") opts.tier = brasslua::ExecutionTier::Baseline;
+            else if (t == "auto") opts.tier = brasslua::ExecutionTier::Auto;
+            else {
+                std::cerr << "brasslua: --tier= takes interp, baseline or auto\n";
+                return 1;
+            }
+            continue;
+        }
         if (std::strcmp(argv[i], "-O0") == 0) {
             opts.optimize = false;
             continue;

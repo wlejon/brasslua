@@ -77,7 +77,6 @@ add_library(brasslua STATIC
     src/codegen/mir_lowering_expr.cpp
     src/codegen/mir_lowering_stmt.cpp
     src/codegen/mir_lowering_for.cpp
-    src/codegen/speculation.cpp
     src/codegen/jit_runner.cpp
 )
 add_library(brasslua::brasslua ALIAS brasslua)

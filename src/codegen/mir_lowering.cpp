@@ -297,13 +297,13 @@ LocalVarInfo MirModuleLowerer::defineLocal(FunctionBuildState& st, uint32_t symb
             BValue* nil_c = b.build_iconst_i64(static_cast<int64_t>(kNilBits));
             info.slot_ptr = b.build_call("brasslua_rt_upvalue_new", Type::ptr(), {nil_c});
         } else {
-            info.slot_ptr = st.emitEntryAlloca(8, 8);
+            info.slot_ptr = st.emitEntrySlots(1);
             st.close_vars.push_back(info.slot_ptr);
         }
     } else {
         info.rep = rep;
         info.is_upvalue = false;
-        info.slot_ptr = st.emitEntryAlloca(8, 8);
+        info.slot_ptr = rep == Rep::Boxed ? st.emitEntrySlots(1) : st.emitEntryAlloca(8, 8);
     }
     st.scopes.back()[symbol_id] = info;
     return info;
@@ -338,25 +338,16 @@ MirValue MirModuleLowerer::loadVar(FunctionBuildState& st, uint32_t symbol_id,
     return MirValue{merge_bb->param(0), Rep::Boxed};
 }
 
-void MirModuleLowerer::emitSite(FunctionBuildState& st, BValue* hit, BasicBlock* fast, BasicBlock* slow, bool bet) {
-    brass::Instruction* br = st.builder.build_br_if(hit, fast, slow);
-    if (!bet) return;
-    if (bets_.empty() || bets_.back().fn != st.fn) bets_.push_back({st.fn, {}});
-    bets_.back().branches.push_back(br);
+void MirModuleLowerer::beginFunction(FunctionBuildState& st) {
+    auto& [fn, sites] = sites_.emplace_back(st.fn, brass::SpecSiteEmitter{});
+    sites.set_feedback(feedback_);
+    sites.begin_function(/*can_deopt=*/true, st.fn->name());
+    st.sites = &sites;
 }
 
-std::vector<ChunkSpeculation::Bets> MirModuleLowerer::takeBets() {
-    // A function's sites may be interleaved with a nested function's.
-    std::vector<ChunkSpeculation::Bets> merged;
-    std::unordered_map<brass::Function*, size_t> index;
-    for (auto& fb : bets_) {
-        auto [it, fresh] = index.emplace(fb.fn, merged.size());
-        if (fresh) merged.push_back({fb.fn, {}});
-        auto& dst = merged[it->second].branches;
-        dst.insert(dst.end(), fb.branches.begin(), fb.branches.end());
-    }
-    bets_.clear();
-    return merged;
+void MirModuleLowerer::emitSite(FunctionBuildState& st, BValue* hit, BasicBlock* fast, BasicBlock* slow,
+                                SpecKind kind) {
+    st.sites->emit_branch(st.builder, hit, fast, slow, static_cast<uint8_t>(kind));
 }
 
 BValue* MirModuleLowerer::emitEnvConst(FunctionBuildState& st) {
@@ -461,6 +452,7 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
         ust.self_func_name = debug_name;
         ust.self_func_symbol_id = func_symbol_id;
         ust.vararg_offset = sig.arity;
+        beginFunction(ust);
         pushScope(ust);
 
         ust.builder.append_block("entry");
@@ -493,6 +485,7 @@ CompiledFuncSig MirModuleLowerer::compileFuncBody(FunctionBuildState* parent_st,
     bst.self_func_name = debug_name;
     bst.self_func_symbol_id = func_symbol_id;
     bst.vararg_offset = sig.arity;
+    beginFunction(bst);
     pushScope(bst);
 
     bst.builder.append_block("entry");
@@ -670,6 +663,7 @@ std::string MirModuleLowerer::lowerChunk(const Chunk& chunk) {
     bst.is_unboxed_variant = false;
     bst.expected_return_rep = Rep::Boxed;
     bst.vararg_offset = 0;
+    beginFunction(bst);
     pushScope(bst);
 
     bst.builder.append_block("entry");
@@ -688,6 +682,13 @@ std::string MirModuleLowerer::lowerChunk(const Chunk& chunk) {
         BValue* nil_c = bst.builder.build_iconst_i64(static_cast<int64_t>(kNilBits));
         bst.builder.build_ret(nil_c);
     }
+    // The builder adds edges without recording predecessors; what reads the
+    // module next (the verifier, liveness, an OSR plan) needs them.
+    for (Function* fn : mod_.functions()) {
+        if (fn && fn->block_count() != 0) fn->rebuild_cfg_predecessors();
+    }
+    for (auto& [fn, sites] : sites_) sites.finish_function(*fn);
+    sites_.clear();
     return entry_sym;
 }
 

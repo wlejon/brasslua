@@ -217,7 +217,7 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                     }
                 }
 
-                BValue* ctrl_slot = st.emitEntryAlloca(8, 8);
+                BValue* ctrl_slot = st.emitEntrySlots(1);
                 b.build_store(Type::i64(), ctrl_slot, 0, ctrl_v);
 
                 BasicBlock* cond_bb = st.newBlock("gfor_cond");
@@ -348,7 +348,7 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                 bool last_is_multiret = isCallOrVararg(*s.values.back());
                 if (last_is_multiret) {
                     size_t fixed_count = s.values.size() - 1;
-                    BValue* ret_buf = st.emitEntryAlloca(static_cast<uint32_t>(fixed_count * 8), 8);
+                    BValue* ret_buf = st.emitEntrySlots(static_cast<uint32_t>(fixed_count));
                     for (size_t i = 0; i < fixed_count; ++i) {
                         MirValue mv = lowerExpr(st, *s.values[i]);
                         BValue* boxed = emitBox(st, mv);
@@ -361,7 +361,7 @@ void MirModuleLowerer::lowerStmt(FunctionBuildState& st, const Stmt& stmt) {
                     return;
                 }
 
-                BValue* ret_buf = st.emitEntryAlloca(static_cast<uint32_t>(s.values.size() * 8), 8);
+                BValue* ret_buf = st.emitEntrySlots(static_cast<uint32_t>(s.values.size()));
                 BValue* r0 = nullptr;
                 for (size_t i = 0; i < s.values.size(); ++i) {
                     MirValue mv = lowerExpr(st, *s.values[i]);

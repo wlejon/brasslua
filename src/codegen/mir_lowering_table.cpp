@@ -20,7 +20,7 @@ BValue* emitIntKeyBet(MirModuleLowerer& lowerer, FunctionBuildState& st, const E
                                 b.build_iconst_i64(static_cast<int64_t>(Tag::Int47)));
     BasicBlock* fast_bb = st.newBlock("key_int");
     slow_bb = st.newColdBlock("key_any");
-    lowerer.emitSite(st, is_int, fast_bb, slow_bb, true);
+    lowerer.emitSite(st, is_int, fast_bb, slow_bb, SpecKind::IntKey);
     b.position_at_end(fast_bb);
     BValue* c16 = b.build_iconst_i64(16);
     return b.build_ashr(b.build_shl(key_bits, c16), c16);

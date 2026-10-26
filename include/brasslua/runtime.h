@@ -10,10 +10,6 @@
 #include <string_view>
 #include <vector>
 
-namespace brass::codegen {
-class JitExecutionEngine;
-}
-
 namespace brass::gc {
 class Heap;
 }
@@ -166,7 +162,16 @@ void resolveChunkSymbols(Chunk& chunk);
 void analyzeAndInferTypes(Chunk& chunk, RuntimeState& rt);
 
 // JIT & AOT Execution Engine (backed by brass)
+// How far brass's tiered pipeline takes a chunk's functions: Interpreter
+// keeps every function in brass's fast interpreter, Baseline compiles each
+// with the baseline JIT when first called, Auto tiers hot functions (and
+// loops, mid-loop) up to optimized code built in the background, where the
+// hints' bets that have held become guards.
+enum class ExecutionTier : uint8_t { Interpreter, Baseline, Auto };
+
 struct ExecutionOptions {
+    ExecutionTier tier = ExecutionTier::Auto;
+    // Whether an object file (compileLuaToObjectFile) is optimized.
     bool optimize = true;
     bool dump_mir = false;
     std::string source_name = "=chunk";
@@ -189,7 +194,5 @@ ExecutionResult evalLuaFile(const std::string& path, const std::vector<std::stri
                             const ExecutionOptions& opts = {});
 bool compileLuaToObjectFile(std::string_view source, const std::string& output_path,
                             const ExecutionOptions& opts = {});
-
-void registerBrassLuaRuntimeSymbols(brass::codegen::JitExecutionEngine& engine);
 
 } // namespace brasslua

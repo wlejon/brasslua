@@ -1,10 +1,14 @@
 #include "codegen/mir_lowering.h"
 
-#include <brass/codegen/jit_exec.hpp>
 #include <brass/mir/pass_pipeline.hpp>
 #include <brass/mir/printer.hpp>
 #include <brass/object/elf_writer.hpp>
 #include <brass/object/object_writer.hpp>
+#include <brass/runtime/code_installer.hpp>
+#include <brass/runtime/multi_tier_pipeline.hpp>
+#include <brass/runtime/native_function.hpp>
+#include <brass/runtime/osr_coordinator.hpp>
+#include <brass/runtime/tiering.hpp>
 
 #include "runtime/runtime_internal.h"
 
@@ -16,131 +20,127 @@
 
 namespace brasslua {
 
-using brass::Type;
-
 namespace {
 
-thread_local std::vector<std::unique_ptr<brass::codegen::JitExecutionEngine>> g_live_engines;
-// Each chunk's speculation, which resumes its failed guards; dropped before
-// the engines holding the code.
-thread_local std::vector<std::unique_ptr<ChunkSpeculation>> g_live_speculation;
+// Every runtime function lowered code calls.
+#define BRASSLUA_RT_FUNCTIONS(X)                                                                          \
+    X(brasslua_rt_table_new) X(brasslua_rt_table_get) X(brasslua_rt_table_set)                           \
+    X(brasslua_rt_table_get_int) X(brasslua_rt_table_set_int) X(brasslua_rt_table_get_field)             \
+    X(brasslua_rt_table_set_field) X(brasslua_rt_table_append_multiret) X(brasslua_rt_table_len)         \
+    X(brasslua_rt_rawget) X(brasslua_rt_rawset) X(brasslua_rt_next) X(brasslua_rt_get_global)            \
+    X(brasslua_rt_set_global) X(brasslua_rt_box_int64) X(brasslua_rt_concat) X(brasslua_rt_obj_len)      \
+    X(brasslua_rt_closure_new) X(brasslua_rt_upvalue_new) X(brasslua_rt_upvalue_get)                     \
+    X(brasslua_rt_upvalue_set) X(brasslua_rt_close_local) X(brasslua_rt_call) X(brasslua_rt_call_0)      \
+    X(brasslua_rt_call_1) X(brasslua_rt_call_2) X(brasslua_rt_call_3) X(brasslua_rt_call_4)              \
+    X(brasslua_rt_call_multiret) X(brasslua_rt_call_method) X(brasslua_rt_call_method_multiret)          \
+    X(brasslua_rt_set_multiret) X(brasslua_rt_prepend_multiret) X(brasslua_rt_set_vararg_multiret)       \
+    X(brasslua_rt_get_multiret_count) X(brasslua_rt_get_multiret) X(brasslua_rt_add) X(brasslua_rt_sub)  \
+    X(brasslua_rt_mul) X(brasslua_rt_div) X(brasslua_rt_idiv) X(brasslua_rt_mod) X(brasslua_rt_pow)      \
+    X(brasslua_rt_unm) X(brasslua_rt_band) X(brasslua_rt_bor) X(brasslua_rt_bxor) X(brasslua_rt_bnot)    \
+    X(brasslua_rt_shl) X(brasslua_rt_shr) X(brasslua_rt_eq) X(brasslua_rt_lt) X(brasslua_rt_le)          \
+    X(brasslua_rt_to_number) X(brasslua_rt_to_int64) X(brasslua_rt_fmod) X(brasslua_rt_pow_f64)          \
+    X(brasslua_rt_idiv_i64) X(brasslua_rt_forprep) X(brasslua_rt_mod_i64)
+
+template <class Target>
+void registerRuntimeFunctions(Target& target) {
+#define BRASSLUA_RT_REGISTER(name) brass::runtime::register_native_function(target, #name, &name);
+    BRASSLUA_RT_FUNCTIONS(BRASSLUA_RT_REGISTER)
+#undef BRASSLUA_RT_REGISTER
+}
+
+// A chunk on brass's tiered pipeline: its module, the program (handles,
+// tiering, background compiler) that runs it, and its speculation counts,
+// which every tier's code increments in place. The table goes first, since
+// it stops the compiler that reads the module and the counts.
+struct TieredChunk {
+    std::unique_ptr<brass::SpecFeedback> feedback;
+    std::unique_ptr<brass::Module> mod;
+    std::unique_ptr<brass::runtime::FunctionDispatchTable> table;
+    ~TieredChunk() { table.reset(); }
+};
+thread_local std::vector<std::unique_ptr<TieredChunk>> g_live_tiered;
+
+// Backedges an interpreted or baseline loop takes before a loop still running
+// asks for its OSR entry (bronze's threshold).
+constexpr uint64_t kOsrBackedgeThreshold = 1000;
+
+brass::PassPipelineOptions optimizedPasses() {
+    brass::PassPipelineOptions popts = brass::production_pass_pipeline_options();
+    popts.enable_sroa = true;
+    // Calls of the function a call is likely of are hinted (emitTargetCall).
+    popts.enable_inlining = true;
+    popts.inliner.only_inline_leaf_functions = false;
+    popts.inliner.max_total_caller_instructions = 6000;
+    return popts;
+}
+
+brass::runtime::TieringConfig tieringConfigFor(ExecutionTier tier) {
+    brass::runtime::TieringConfig config;
+    config.set_tier0_interpreter(brass::runtime::Tier0Interpreter::Fast);
+    switch (tier) {
+        case ExecutionTier::Interpreter: config.max_tier = brass::runtime::TierLevel::Tier0_Interpreter; break;
+        case ExecutionTier::Baseline: config.max_tier = brass::runtime::TierLevel::Tier1_Baseline; break;
+        case ExecutionTier::Auto:
+            config.enable_background_compile = true;
+            config.enable_background_tier1 = true;
+            break;
+    }
+    return config;
+}
+
+LuaNativeFn loadTiered(std::unique_ptr<TieredChunk> chunk, const std::string& entry_sym, ExecutionTier tier) {
+    chunk->table = std::make_unique<brass::runtime::FunctionDispatchTable>();
+    brass::runtime::MultiTierPipeline& pipeline = chunk->table->pipeline();
+    pipeline.initialize(tieringConfigFor(tier));
+    registerRuntimeFunctions(pipeline);
+    if (tier == ExecutionTier::Auto) {
+        // A hot function's copy, or a hot loop's OSR entry, has the bets
+        // that held armed as guards (a lost one finishes the call in Tier 0)
+        // and the rest kept as branches, then is optimized.
+        brass::SpecFeedback* feedback = chunk->feedback.get();
+        pipeline.set_tier2_front_pass([feedback](brass::Module& copy) {
+            brass::arm_speculation_sites(copy, *feedback);
+        });
+        // A guard that failed often enough to drop its code is never armed
+        // again.
+        pipeline.set_invalidation_observer(
+            [feedback](std::string_view, uint32_t resume_id) { feedback->mark_failed(resume_id); });
+        pipeline.set_tier2_passes(optimizedPasses());
+        brass::runtime::OsrCoordinator& osr = chunk->table->osr();
+        osr.set_threshold(kOsrBackedgeThreshold);
+        osr.set_enabled(true);
+    }
+    const brass::Function* entry = chunk->mod->get_function(entry_sym);
+    if (!entry) throw std::runtime_error("entry symbol not found in the chunk's module");
+    for (const brass::Function* fn : chunk->mod->functions()) {
+        if (fn && fn->block_count() != 0) chunk->table->get_or_create(fn->name(), fn);
+    }
+    auto entry_fn = reinterpret_cast<LuaNativeFn>(pipeline.function_address(entry_sym, entry));
+    if (!entry_fn) throw std::runtime_error("the chunk's entry has no address");
+    g_live_tiered.push_back(std::move(chunk));
+    return entry_fn;
+}
 
 } // namespace
-
-void registerBrassLuaRuntimeSymbols(brass::codegen::JitExecutionEngine& engine) {
-    auto reg = [&](const char* name, auto fn_ptr, Type ret, std::initializer_list<Type> params) {
-        engine.register_external_symbol(name, reinterpret_cast<void*>(fn_ptr));
-        engine.register_function_signature(name, ret, std::vector<Type>(params));
-    };
-
-    reg("brasslua_rt_resume", &brasslua_rt_resume, Type::i64(), {Type::i64(), Type::i32(), Type::ptr()});
-    reg("brasslua_rt_table_new", &brasslua_rt_table_new, Type::i64(), {Type::i32(), Type::i32()});
-    reg("brasslua_rt_table_get", &brasslua_rt_table_get, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_table_set", &brasslua_rt_table_set, Type::i64(), {Type::i64(), Type::i64(), Type::i64()});
-    reg("brasslua_rt_table_get_int", &brasslua_rt_table_get_int, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_table_set_int", &brasslua_rt_table_set_int, Type::i64(), {Type::i64(), Type::i64(), Type::i64()});
-    reg("brasslua_rt_table_get_field", &brasslua_rt_table_get_field, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_table_set_field", &brasslua_rt_table_set_field, Type::i64(), {Type::i64(), Type::i64(), Type::i64()});
-    reg("brasslua_rt_table_append_multiret", &brasslua_rt_table_append_multiret, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_table_len", &brasslua_rt_table_len, Type::i64(), {Type::i64()});
-    reg("brasslua_rt_rawget", &brasslua_rt_rawget, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_rawset", &brasslua_rt_rawset, Type::i64(), {Type::i64(), Type::i64(), Type::i64()});
-    reg("brasslua_rt_next", &brasslua_rt_next, Type::i64(), {Type::i64(), Type::i64(), Type::ptr()});
-
-    reg("brasslua_rt_get_global", &brasslua_rt_get_global, Type::i64(), {Type::i32()});
-    reg("brasslua_rt_set_global", &brasslua_rt_set_global, Type::void_type(), {Type::i32(), Type::i64()});
-
-    reg("brasslua_rt_box_int64", &brasslua_rt_box_int64, Type::i64(), {Type::i64()});
-    reg("brasslua_rt_concat", &brasslua_rt_concat, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_obj_len", &brasslua_rt_obj_len, Type::i64(), {Type::i64()});
-
-    reg("brasslua_rt_closure_new", &brasslua_rt_closure_new, Type::i64(), {Type::ptr(), Type::ptr(), Type::i32(), Type::i32()});
-    reg("brasslua_rt_upvalue_new", &brasslua_rt_upvalue_new, Type::ptr(), {Type::i64()});
-    reg("brasslua_rt_upvalue_get", &brasslua_rt_upvalue_get, Type::i64(), {Type::ptr(), Type::i32()});
-    reg("brasslua_rt_upvalue_set", &brasslua_rt_upvalue_set, Type::void_type(), {Type::ptr(), Type::i32(), Type::i64()});
-    reg("brasslua_rt_close_local", &brasslua_rt_close_local, Type::void_type(), {Type::i64()});
-
-    reg("brasslua_rt_call", &brasslua_rt_call, Type::i64(), {Type::i64(), Type::ptr(), Type::i64()});
-    reg("brasslua_rt_call_0", &brasslua_rt_call_0, Type::i64(), {Type::i64()});
-    reg("brasslua_rt_call_1", &brasslua_rt_call_1, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_call_2", &brasslua_rt_call_2, Type::i64(), {Type::i64(), Type::i64(), Type::i64()});
-    reg("brasslua_rt_call_3", &brasslua_rt_call_3, Type::i64(), {Type::i64(), Type::i64(), Type::i64(), Type::i64()});
-    reg("brasslua_rt_call_4", &brasslua_rt_call_4, Type::i64(), {Type::i64(), Type::i64(), Type::i64(), Type::i64(), Type::i64()});
-    reg("brasslua_rt_call_multiret", &brasslua_rt_call_multiret, Type::i64(), {Type::i64(), Type::ptr(), Type::i64()});
-    reg("brasslua_rt_call_method", &brasslua_rt_call_method, Type::i64(), {Type::i64(), Type::i64(), Type::ptr(), Type::i64()});
-    reg("brasslua_rt_call_method_multiret", &brasslua_rt_call_method_multiret, Type::i64(), {Type::i64(), Type::i64(), Type::ptr(), Type::i64()});
-    reg("brasslua_rt_set_multiret", &brasslua_rt_set_multiret, Type::void_type(), {Type::ptr(), Type::i64()});
-    reg("brasslua_rt_prepend_multiret", &brasslua_rt_prepend_multiret, Type::i64(), {Type::ptr(), Type::i64()});
-    reg("brasslua_rt_set_vararg_multiret", &brasslua_rt_set_vararg_multiret, Type::i64(), {Type::ptr(), Type::i64(), Type::i64()});
-    reg("brasslua_rt_get_multiret_count", &brasslua_rt_get_multiret_count, Type::i64(), {});
-    reg("brasslua_rt_get_multiret", &brasslua_rt_get_multiret, Type::i64(), {Type::i64()});
-
-    reg("brasslua_rt_add", &brasslua_rt_add, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_sub", &brasslua_rt_sub, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_mul", &brasslua_rt_mul, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_div", &brasslua_rt_div, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_idiv", &brasslua_rt_idiv, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_mod", &brasslua_rt_mod, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_pow", &brasslua_rt_pow, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_unm", &brasslua_rt_unm, Type::i64(), {Type::i64()});
-    reg("brasslua_rt_band", &brasslua_rt_band, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_bor", &brasslua_rt_bor, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_bxor", &brasslua_rt_bxor, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_bnot", &brasslua_rt_bnot, Type::i64(), {Type::i64()});
-    reg("brasslua_rt_shl", &brasslua_rt_shl, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_shr", &brasslua_rt_shr, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_eq", &brasslua_rt_eq, Type::i32(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_lt", &brasslua_rt_lt, Type::i32(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_le", &brasslua_rt_le, Type::i32(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_to_number", &brasslua_rt_to_number, Type::f64(), {Type::i64()});
-    reg("brasslua_rt_to_int64", &brasslua_rt_to_int64, Type::i64(), {Type::i64()});
-
-    reg("brasslua_rt_fmod", &brasslua_rt_fmod, Type::f64(), {Type::f64(), Type::f64()});
-    reg("brasslua_rt_pow_f64", &brasslua_rt_pow_f64, Type::f64(), {Type::f64(), Type::f64()});
-    reg("brasslua_rt_idiv_i64", &brasslua_rt_idiv_i64, Type::i64(), {Type::i64(), Type::i64()});
-    reg("brasslua_rt_forprep", &brasslua_rt_forprep, Type::i64(), {Type::i64(), Type::i64(), Type::i64(), Type::ptr()});
-    reg("brasslua_rt_mod_i64", &brasslua_rt_mod_i64, Type::i64(), {Type::i64(), Type::i64()});
-}
 
 LuaNativeFn compileLuaChunk(std::string_view source, const ExecutionOptions& opts) {
     auto& rt = RuntimeState::current();
     Chunk chunk = parseLuaSource(source, opts.source_name);
     analyzeAndInferTypes(chunk, rt);
 
-    brass::Module mod(opts.source_name);
-    MirModuleLowerer lowerer(rt, mod);
+    auto tiered = std::make_unique<TieredChunk>();
+    // Only optimized code speculates: a lower tier runs each site's branch.
+    // A bet is armed while it has held every time.
+    if (opts.tier == ExecutionTier::Auto) {
+        tiered->feedback = std::make_unique<brass::SpecFeedback>(
+            [](uint8_t, uint32_t misses) { return misses == 0; });
+    }
+    tiered->mod = std::make_unique<brass::Module>(opts.source_name);
+    MirModuleLowerer lowerer(rt, *tiered->mod, tiered->feedback.get());
     std::string entry_sym = lowerer.lowerChunk(chunk);
-    auto spec = std::make_unique<ChunkSpeculation>();
-    spec->arm(mod, lowerer.takeBets());
-
-    if (opts.optimize) {
-        brass::PassPipelineOptions popts = brass::production_pass_pipeline_options();
-        popts.enable_sroa = true;
-        // Calls of the function a call is likely of are hinted (emitTargetCall).
-        popts.enable_inlining = true;
-        popts.inliner.only_inline_leaf_functions = false;
-        popts.inliner.max_total_caller_instructions = 6000;
-        brass::run_pass_pipeline(mod, popts);
-    }
-
-    if (opts.dump_mir) {
-        brass::print_module(mod, std::cerr);
-    }
-
-    auto engine = std::make_unique<brass::codegen::JitExecutionEngine>();
-    registerBrassLuaRuntimeSymbols(*engine);
-    if (!engine->compile_and_load(mod)) {
-        throw std::runtime_error("brass JIT compilation failed");
-    }
-    auto entry_fn = engine->get_function_ptr<LuaNativeFn>(entry_sym);
-    if (!entry_fn) {
-        throw std::runtime_error("entry symbol not found after JIT compilation");
-    }
-    spec->install(*engine);
+    if (opts.dump_mir) brass::print_module(*tiered->mod, std::cerr);
     // The chunk's code, and the closures it makes, live as long as the thread.
-    g_live_engines.push_back(std::move(engine));
-    g_live_speculation.push_back(std::move(spec));
-    return entry_fn;
+    return loadTiered(std::move(tiered), entry_sym, opts.tier);
 }
 
 ExecutionResult evalLuaSource(std::string_view source, const ExecutionOptions& opts,

@@ -1,14 +1,15 @@
 #pragma once
 
 #include "brasslua/runtime.h"
-#include "codegen/speculation.h"
 
 #include <brass/mir/block.hpp>
 #include <brass/mir/builder.hpp>
 #include <brass/mir/function.hpp>
 #include <brass/mir/module.hpp>
+#include <brass/mir/speculation_sites.hpp>
 #include <brass/mir/types.hpp>
 
+#include <deque>
 #include <initializer_list>
 #include <string>
 #include <string_view>
@@ -66,6 +67,8 @@ struct LoopContext {
 struct FunctionBuildState {
     brass::Function* fn = nullptr;
     brass::Builder builder;
+    // This function's speculation sites (MirModuleLowerer::beginFunction).
+    brass::SpecSiteEmitter* sites = nullptr;
     bool is_unboxed_variant = false;
     // Set by lowerMultiExpr for the call it lowers, which then leaves all its
     // results in the multiret buffer; any other call wants one result.
@@ -114,7 +117,26 @@ struct FunctionBuildState {
         return builder.current_block() && builder.current_block()->terminator() != nullptr;
     }
 
+    // A frame buffer of raw words (unboxed numbers): no GC root.
     brass::Value* emitEntryAlloca(uint32_t size = 8, uint32_t align = 8) {
+        return atEntry([&] { return builder.build_alloca(size, align); });
+    }
+    // A frame buffer of `words` Lua values: each a GC root at every GC point
+    // of the function, whichever tier runs it.
+    brass::Value* emitEntrySlots(uint32_t words) {
+        return atEntry([&] { return builder.build_alloca_tagged(words); });
+    }
+
+    brass::Value* getArgsScratch() {
+        if (!args_scratch) {
+            args_scratch = emitEntrySlots(16);
+        }
+        return args_scratch;
+    }
+
+private:
+    template <typename Build>
+    brass::Value* atEntry(Build&& build) {
         brass::BasicBlock* cur = builder.current_block();
         brass::BasicBlock* entry = fn->entry_block();
         if (entry && !entry->is_empty()) {
@@ -122,23 +144,26 @@ struct FunctionBuildState {
         } else if (entry) {
             builder.position_at_end(entry);
         }
-        brass::Value* ptr = builder.build_alloca(size, align);
+        brass::Value* ptr = build();
         builder.position_at_end(cur);
         return ptr;
     }
+};
 
-    brass::Value* getArgsScratch() {
-        if (!args_scratch) {
-            args_scratch = emitEntryAlloca(128, 8);
-        }
-        return args_scratch;
-    }
+// What a speculation site tests (brass::SpecFeedback's kinds).
+enum class SpecKind : uint8_t {
+    Arith = 0,   // operands of the types their hints say
+    Builtin = 1, // the callee is the library function the hints name
+    IntKey = 2,  // a table key is an inline integer
 };
 
 class MirModuleLowerer {
 public:
-    MirModuleLowerer(RuntimeState& rt, brass::Module& mod)
-        : rt_(rt), mod_(mod) {}
+    // `feedback`: the chunk's speculation counts, for a module brass's tiered
+    // pipeline runs (its sites then carry the guards tier 2 arms); null
+    // lowers every site as its plain branch.
+    MirModuleLowerer(RuntimeState& rt, brass::Module& mod, brass::SpecFeedback* feedback = nullptr)
+        : rt_(rt), mod_(mod), feedback_(feedback) {}
 
     std::string lowerChunk(const Chunk& chunk);
 
@@ -212,13 +237,15 @@ public:
     CompiledFuncSig compileFuncBody(FunctionBuildState* parent_st, const std::string& debug_name,
                                     uint32_t func_symbol_id, const FuncBody& fbody, bool has_implicit_self);
 
-    // A speculation site (codegen/speculation.h): ends the block with
-    // `br_if hit, fast, slow`, slow the generic code. A bet when the hints
-    // say hit is the likely case.
+    // Starts `st`'s function: its speculation sites, finished once the
+    // chunk's CFG is (lowerChunk).
+    void beginFunction(FunctionBuildState& st);
+    // A speculation site where the hints say `hit` is the likely case
+    // (brass/mir/speculation_sites.hpp): ends the block with
+    // `br_if hit, fast, slow`, slow the generic code, and leaves the builder
+    // at the end of `slow`.
     void emitSite(FunctionBuildState& st, brass::Value* hit, brass::BasicBlock* fast, brass::BasicBlock* slow,
-                  bool bet);
-    // The bets of every function lowered, for ChunkSpeculation::arm.
-    std::vector<ChunkSpeculation::Bets> takeBets();
+                  SpecKind kind);
 
     RuntimeState& rt() noexcept { return rt_; }
     brass::Module& mod() noexcept { return mod_; }
@@ -236,7 +263,10 @@ private:
     brass::Module& mod_;
     uint32_t next_fn_id_ = 1;
     std::unordered_map<std::string, CompiledFuncSig> known_functions_;
-    std::vector<ChunkSpeculation::Bets> bets_;
+    brass::SpecFeedback* feedback_ = nullptr;
+    // Every function's sites, at stable addresses (a nested function's
+    // lowering interleaves with its parent's).
+    std::deque<std::pair<brass::Function*, brass::SpecSiteEmitter>> sites_;
 };
 
 } // namespace brasslua
