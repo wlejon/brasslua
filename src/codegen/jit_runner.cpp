@@ -133,7 +133,7 @@ LuaNativeFn compileLuaChunk(std::string_view source, const ExecutionOptions& opt
     // A bet is armed while it has held every time.
     if (opts.tier == ExecutionTier::Auto) {
         tiered->feedback = std::make_unique<brass::SpecFeedback>(
-            [](uint8_t, uint32_t misses) { return misses == 0; });
+            [](uint8_t, uint32_t misses, bool /*ran*/) { return misses == 0; });
     }
     tiered->mod = std::make_unique<brass::Module>(opts.source_name);
     MirModuleLowerer lowerer(rt, *tiered->mod, tiered->feedback.get());
