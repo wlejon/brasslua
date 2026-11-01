@@ -68,24 +68,32 @@ int runRuntimeJitTests() {
     {
         bool ok = false;
         std::string out = runAndCapture(R"(
+            -- brass reads the collecting thread's stack conservatively, and a
+            -- live native frame may still hold a word naming an object whose
+            -- Lua local is dead. The objects that must go are made and dropped
+            -- in frames that have returned before the collection.
             local wt = setmetatable({}, { __mode = "v" })
-            do
+            local function scope()
                 local keep = { name = "alive" }
                 wt[1] = keep
-                wt[2] = { name = "ephemeral" }
-                local dropped = { name = "dropped_local" }
-                wt[3] = dropped
-                dropped = nil
-                do
-                    local scoped = { name = "scoped_local" }
-                    wt[4] = scoped
+                local function fill()
+                    wt[2] = { name = "ephemeral" }
+                    local dropped = { name = "dropped_local" }
+                    wt[3] = dropped
+                    dropped = nil
+                    do
+                        local scoped = { name = "scoped_local" }
+                        wt[4] = scoped
+                    end
                 end
+                fill()
                 wt[5] = "strings_are_not_weak_collected"
                 wt[6] = 12345
                 collectgarbage()
                 print(wt[1] == keep and wt[2] == nil and wt[3] == nil and wt[4] == nil)
                 print(wt[5], wt[6])
             end
+            scope()
             collectgarbage("collect")
             print(wt[1] == nil)
             print(collectgarbage("isrunning"))
