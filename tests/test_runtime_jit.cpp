@@ -3,6 +3,8 @@
 #include <brass/gc/heap.hpp>
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -209,9 +211,24 @@ int runRuntimeJitTests() {
 
     // 6. AOT Object File Compilation
     {
-        std::string obj_path = "/tmp/brasslua_aot_test.o";
+        std::string obj_path = (std::filesystem::temp_directory_path() / "brasslua_aot_test.o").string();
         bool aot_ok = compileLuaToObjectFile("local x = 0 for i = 1, 100 do x = x + i end return x", obj_path);
-        EXPECT_TRUE(aot_ok, "compileLuaToObjectFile emits native .o file");
+        EXPECT_TRUE(aot_ok, "compileLuaToObjectFile emits native object file");
+        std::ifstream in(obj_path, std::ios::binary);
+        unsigned char magic[4] = {0, 0, 0, 0};
+        in.read(reinterpret_cast<char*>(magic), 4);
+#if defined(_WIN32)
+        // COFF machine header: AMD64 (0x8664 LE) or ARM64 (0xAA64 LE)
+        bool valid_magic = (magic[0] == 0x64 && magic[1] == 0x86) || (magic[0] == 0x64 && magic[1] == 0xAA);
+#elif defined(__APPLE__)
+        // Mach-O 64-bit magic (0xFEEDFACF LE: CF FA ED FE)
+        bool valid_magic = (magic[0] == 0xCF && magic[1] == 0xFA && magic[2] == 0xED && magic[3] == 0xFE);
+#else
+        // ELF magic (0x7F 'E' 'L' 'F')
+        bool valid_magic = (magic[0] == 0x7F && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F');
+#endif
+        EXPECT_TRUE(in.good() && valid_magic, "compileLuaToObjectFile emits host object format");
+        in.close();
         std::remove(obj_path.c_str());
     }
 

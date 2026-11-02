@@ -2,7 +2,9 @@
 
 #include <brass/mir/pass_pipeline.hpp>
 #include <brass/mir/printer.hpp>
+#include <brass/object/coff_writer.hpp>
 #include <brass/object/elf_writer.hpp>
+#include <brass/object/macho_writer.hpp>
 #include <brass/object/object_writer.hpp>
 #include <brass/runtime/code_installer.hpp>
 #include <brass/runtime/multi_tier_pipeline.hpp>
@@ -221,8 +223,21 @@ bool compileLuaToObjectFile(std::string_view source, const std::string& output_p
     brass::object::ModuleCompiler compiler(brass::Target::host());
     compiler.set_enable_mir_opts(false);
     brass::object::ObjectFile obj = compiler.compile(mod);
-    brass::object::ElfWriter writer(obj);
-    return writer.write_to_file(output_path);
+    switch (obj.target.object_format()) {
+        case brass::ObjectFormat::COFF: {
+            brass::object::CoffWriter writer(obj);
+            return writer.write_to_file(output_path);
+        }
+        case brass::ObjectFormat::MachO: {
+            brass::object::MachOWriter writer(obj);
+            return writer.write_to_file(output_path);
+        }
+        case brass::ObjectFormat::ELF64:
+        default: {
+            brass::object::ElfWriter writer(obj);
+            return writer.write_to_file(output_path);
+        }
+    }
 }
 
 } // namespace brasslua
